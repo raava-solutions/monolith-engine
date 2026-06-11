@@ -78,7 +78,7 @@ class Engine:
     async def delete(self, container_id: str) -> None:
         """Remove the container and mark it deleted in storage (fail-closed on tenant)."""
         record = await self.storage.get_container(container_id, tenant_id=self.tenant_id)
-        if record is None:
+        if record is None or record.status == "deleted":
             raise LookupError(f"container '{container_id}' not found")
         if await self.provider.exists(record.id):
             await self.provider.delete(record.id)
