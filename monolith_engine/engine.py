@@ -76,8 +76,8 @@ class Engine:
     async def chat(self, container_id: str, message: str, *, timeout: int = 120) -> str:
         """Resolve a tenant-scoped container, then dispatch to its agent runtime.
 
-        Falls back to a raw shell one-shot when no agent runtime is present
-        (containers provisioned without an agent — the Ring 0 proof shape).
+        Every container is agent-backed, so chat always relays through the
+        agent one-shot — there is no bare-container path.
         """
         record = await self.storage.get_container(container_id, tenant_id=self.tenant_id)
         if record is None or record.status == "deleted":
