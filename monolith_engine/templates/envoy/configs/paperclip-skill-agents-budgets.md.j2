@@ -1,0 +1,37 @@
+---
+name: paperclip-agents-budgets
+description: Read Paperclip agents, skills, status, costs, and budgets.
+---
+
+# paperclip agents budgets
+
+Use this skill for agent health, staffing, role fit, cost, and budget questions.
+
+## scope
+- agent list and detail
+- agent status, heartbeat, costs, and skills
+- company, project, and agent budgets
+- burn rate and budget history
+
+## protocol
+1. Read agent status and budget context together when cost or performance is
+   part of the question.
+2. Treat heartbeat loss beyond Paperclip recovery as an Argus escalation
+   candidate. Do not operate the VM yourself.
+3. Draft reconfiguration, hire, pause, resume, terminate, or budget changes as
+   proposals first.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/agents --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/status --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/costs --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/skills --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/budgets --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /budgets/<budget_id>/history --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /budgets/<budget_id>/burn-rate --company-id <company_id>
+```
+
+## output
+Separate observed facts, recommendation, and approval-needed actions.

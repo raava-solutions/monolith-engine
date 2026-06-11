@@ -1,0 +1,105 @@
+name: argus
+display_name: Argus Fleet Operator
+description: "Fleet operator agent with proposal-first policy, Fleet API tooling, and monolith-fleet CLI guardrails"
+version: "0.1.0"
+visibility: admin
+category: fleet-operations
+runtime: hermes
+base_image: raava-hermes-golden
+service_name: hermes-gateway
+capabilities:
+  - fleet-health
+  - drift-triage
+  - cost-proposals
+  - proposal-first-ops
+
+defaults:
+  memory: "4GB"
+  cpu: "2"
+  disk: "30GB"
+  model_provider: openrouter
+  model: "google/gemini-3-flash-preview"
+  timezone: "America/New_York"
+  personality: "professional"
+  secrets_mode: env
+  fleet_operator_mode: true
+  write_mode: proposal_only
+  cli_output_format: toon
+  install_extras: messaging
+  hermes_ref: raava-fleet-operator-v1
+  fleet_api_url_default: "https://api.fleetos.raavasolutions.com"
+  fleet_api_url: "https://api.fleetos.raavasolutions.com"
+
+fields:
+  - name: model
+    type: string
+    required: true
+    description: "LLM model ID on OpenRouter"
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+  - name: system_prompt
+    type: text
+    required: false
+    description: "Custom SOUL.md content. Overrides the default Argus fleet-operator soul."
+  - name: secrets_mode
+    type: string
+    required: false
+    default: env
+    enum: [env]
+  - name: fleet_operator_mode
+    type: boolean
+    required: false
+    default: true
+  - name: fleet_api_url
+    type: string
+    required: false
+    default: "https://api.fleetos.raavasolutions.com"
+  - name: monolith_api_url
+    type: string
+    required: false
+    description: "Optional Monolith CLI API URL. Defaults to fleet_api_url."
+  - name: write_mode
+    type: string
+    required: false
+    default: proposal_only
+    enum: [proposal_only, approved_only]
+  - name: cli_output_format
+    type: string
+    required: false
+    default: toon
+    enum: [json, toon, table, summary, evidence]
+  - name: hermes_ref
+    type: string
+    required: false
+    default: raava-fleet-operator-v1
+  - name: install_extras
+    type: string
+    required: false
+    default: messaging
+
+secret_slots:
+  - env_var: OPENROUTER_API_KEY
+    required: true
+    description: "API key for the model provider"
+  - env_var: FLEET_API_TOKEN
+    required: false
+    description: "Bearer token for Fleet API MCP and monolith-fleet calls"
+
+integrations:
+  - name: fleet-api
+    description: "Fleet API MCP server for governed fleet operations"
+    secrets:
+      - key: FLEET_API_TOKEN
+        op_ref: "op://{vault}/Fleet API Token/credential"
+
+health_check: "pgrep -f 'hermes_cli.main gateway'"
+
+providers:
+  lxd:
+    image: raava-hermes-golden
+  gce:
+    machine_image: raava-base-hermes
+    machine_type: e2-small
+    disk_size_gb: 50

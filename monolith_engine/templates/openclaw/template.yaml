@@ -1,0 +1,77 @@
+name: openclaw
+display_name: OpenClaw Agent
+description: "Multi-agent orchestration platform with sub-agent spawning, browser automation, and workspace management"
+version: "2026.2.23"
+visibility: admin
+base_image: agent-golden-image
+service_name: openclaw-gateway
+
+defaults:
+  memory: "8GB"
+  cpu: "4"
+  disk: "30GB"
+  model_provider: openrouter
+  model: "google/gemini-3-flash-preview"
+  timezone: "America/New_York"
+  gateway_port: "18789"
+
+fields:
+  - name: model
+    type: string
+    required: true
+    description: "Default LLM model ID"
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+  - name: system_prompt
+    type: text
+    required: false
+    description: "Custom SOUL.md for the main agent workspace"
+  - name: timezone
+    type: string
+    required: false
+    default: "America/New_York"
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+    description: "Model provider: openrouter, ollama, endpoint (local OpenAI-compatible)"
+  - name: model_base_url
+    type: string
+    required: false
+    description: "OpenAI-compatible base URL for local model providers (ollama, endpoint), e.g. http://host.docker.internal:11434/v1"
+  - name: gateway_port
+    type: string
+    required: false
+    default: "18789"
+    description: "Port for the OpenClaw gateway"
+
+integrations:
+  - name: discord
+    description: "Discord messaging"
+    secrets:
+      - key: DISCORD_BOT_TOKEN
+        op_ref: "op://{vault}/Discord Bot/token"
+  - name: web_search
+    description: "Brave Search"
+    secrets:
+      - key: BRAVE_SEARCH_API_KEY
+        op_ref: "op://{vault}/Brave Search API/api-key"
+  - name: email
+    description: "AgentMail email integration"
+    secrets:
+      - key: AGENTMAIL_API_KEY
+        op_ref: "op://{vault}/AgentMail API/api-key"
+
+health_check: "pgrep -f 'openclaw-gateway\\|openclaw gateway'"
+
+providers:
+  lxd:
+    image: agent-golden-image
+  gce:
+    machine_image: raava-base-openclaw
+    machine_type: e2-standard-2
+    disk_size_gb: 50
+  docker:
+    image: monolith-openclaw-golden:latest

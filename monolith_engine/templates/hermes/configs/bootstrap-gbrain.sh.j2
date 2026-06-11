@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# bootstrap-gbrain.sh — idempotent on-VM bootstrap for the gbrain shim.
+#
+# Runs as the last step of provision.sh on a freshly-provisioned Raava
+# Hermes agent VM. Assumes the Fleet API render pipeline has already placed
+# the following files under /tmp/raava-provision/:
+#   - gbrain-mcp        (the read-only MCP shim)
+#   - gbrain.env        (OAuth client_id + secret rendered from per-agent
+#                        OAuth secret in Secret Manager)
+#   - gbrain.conf       (systemd EnvironmentFile drop-in)
+#
+# This script's job is to install those files in their final locations,
+# verify the systemd drop-in is wired, and smoke the chain end-to-end as
+# the agent user. It is safe to re-run; failures emit a WARNING but never
+# abort the parent provisioner.
+#
+# Tenant guard: the gbrain wiring is for raava-tenant=raava agents only.
+# This is a runtime backstop on top of the Fleet API's gbrain_enabled gate;
+# defense in depth.
+#
+# Usage:
+#   bootstrap-gbrain.sh [<agent-slug>]   # agent-slug is informational only
+#
+# Exit codes:
+#   0 — bootstrap complete and smoke passed
+#   1 — tenant guard rejected (raava-tenant != raava); skipped
+#   2 — required input file missing
+#   3 — install step failed
+#   4 — smoke failed (env wired but query did not return hits)
+
+set -uo pipefail
+
+AGENT_SLUG="${1:-unknown}"
+PROVISION_DIR="/tmp/raava-provision"
+ENV_DEST="/etc/raava/gbrain.env"
+DROPIN_DEST="/etc/systemd/system/hermes-gateway.service.d/gbrain.conf"
+SHIM_DEST="/usr/local/bin/gbrain"
+
+log() { printf '[bootstrap-gbrain] %s\n' "$*"; }
+
+# ─── 0. tenant guard ──────────────────────────────────────────────────────
+TENANT="$(curl -sfm 2 -H 'Metadata-Flavor: Google' \
+  'http://metadata.google.internal/computeMetadata/v1/instance/attributes/raava-tenant' 2>/dev/null \
+  || curl -sfm 2 -H 'Metadata-Flavor: Google' \
+  'http://metadata.google.internal/computeMetadata/v1/instance/labels/raava-tenant' 2>/dev/null \
+  || echo unknown)"
+
+if [[ "${TENANT}" != "raava" ]]; then
+  log "tenant=${TENANT}; gbrain wiring is for raava-tenant only — skipping"
+  exit 1
+fi
+
+log "tenant guard OK (raava-tenant=raava) agent=${AGENT_SLUG}"
+
+# ─── 1. verify provisioner inputs ─────────────────────────────────────────
+for f in "${PROVISION_DIR}/gbrain-mcp" "${PROVISION_DIR}/gbrain.env" "${PROVISION_DIR}/gbrain.conf"; do
+  if [[ ! -f "${f}" ]]; then
+    log "ERROR: required input missing: ${f}"
+    exit 2
+  fi
+done
+
+# ─── 2. install ───────────────────────────────────────────────────────────
+mkdir -p /etc/raava /etc/systemd/system/hermes-gateway.service.d || { log "mkdir failed"; exit 3; }
+
+install -m 0755 "${PROVISION_DIR}/gbrain-mcp" "${SHIM_DEST}" || { log "shim install failed"; exit 3; }
+
+# env file: read-only to agent group; never world-readable
+install -m 0640 -o root -g agent "${PROVISION_DIR}/gbrain.env" "${ENV_DEST}" || { log "env install failed"; exit 3; }
+
+install -m 0644 "${PROVISION_DIR}/gbrain.conf" "${DROPIN_DEST}" || { log "dropin install failed"; exit 3; }
+
+systemctl daemon-reload || { log "daemon-reload failed"; exit 3; }
+
+log "installed: ${SHIM_DEST}, ${ENV_DEST}, ${DROPIN_DEST}"
+
+# ─── 3. smoke as agent user ───────────────────────────────────────────────
+# Sanity check the chain without restarting hermes-gateway (caller decides
+# whether to restart). We source the env in a subshell as the agent user
+# and ask gbrain a trivial question.
+SMOKE_OUTPUT="$(sudo -u agent bash -c '
+  set -a; source /etc/raava/gbrain.env; set +a
+  /usr/local/bin/gbrain query "company overview" 2>&1
+' || true)"
+
+if grep -q '"slug"' <<<"${SMOKE_OUTPUT}"; then
+  TOP="$(sed -n 's/^data: //p' <<<"${SMOKE_OUTPUT}" | head -1 | jq -r '.result.content[0].text' 2>/dev/null | jq -r '.[0].slug' 2>/dev/null || echo unknown)"
+  log "smoke OK; top hit: ${TOP}"
+  exit 0
+fi
+
+log "WARNING: smoke returned no hits; gbrain is installed but unreachable"
+log "first 300 bytes of smoke output: ${SMOKE_OUTPUT:0:300}"
+exit 4

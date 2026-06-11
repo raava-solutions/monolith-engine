@@ -1,0 +1,383 @@
+"""Aurum steering plugin.
+
+This plugin is intentionally deterministic: it derives a bounded task class
+from the latest user message and injects a compact steering block before the
+LLM turn. It does not call external services or persist user content.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from datetime import datetime, time as wall_time, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+LOGGER = logging.getLogger(__name__)
+DEFAULT_TIMEZONE = {{ (aurum_steering_timezone | default(timezone | default('America/New_York'))) | tojson }}
+PROFILE = {{ (aurum_steering_profile | default('aurum-trader-chief-of-staff')) | tojson }}
+AURUM_CONTEXT_DIR = Path(os.getenv("AURUM_CONTEXT_DIR", "/home/agent/.hermes/aurum"))
+AURUM_CONTEXT_MAX_CHARS = 700
+
+CONTEXT_PROFILE_INTENTS = {
+    "unsafe_or_regulated_request",
+    "trade_idea",
+    "risk_review",
+    "journal_or_review",
+    "portfolio_check",
+}
+
+
+TASK_RULES = (
+    (
+        "unsafe_or_regulated_request",
+        (
+            "guarantee",
+            "guaranteed profit",
+            "sure thing",
+            "can't miss",
+            "cant miss",
+            "all in",
+            "risk free",
+            "no risk",
+            "inside information",
+            "insider",
+            "execute trade",
+            "execute the trade",
+            "place the trade",
+            "place the order",
+            "buy it for me",
+            "sell it for me",
+        ),
+    ),
+    (
+        "trade_idea",
+        (
+            "trade",
+            "thesis",
+            "invalidation",
+            "entry",
+            "enter",
+            "exit",
+            "stop loss",
+            "take profit",
+            "calls",
+            "puts",
+            "option",
+            "a long",
+            "long setup",
+            "short idea",
+            "should i buy",
+            "should i sell",
+        ),
+    ),
+    (
+        "journal_or_review",
+        (
+            "journal",
+            "post-market",
+            "post market",
+            "post-mortem",
+            "post mortem",
+            "review yesterday",
+            "review the trade",
+            "review my execution",
+            "review my loss",
+            "extract a lesson",
+            "write the lesson",
+            "trading mistakes",
+            "losses",
+            "impulsive losses",
+            "trades today",
+        ),
+    ),
+    (
+        "risk_review",
+        (
+            "risk",
+            "drawdown",
+            "exposure",
+            "exposed",
+            "position size",
+            "max loss",
+            "hedge",
+            "downside",
+        ),
+    ),
+    (
+        "portfolio_check",
+        (
+            "portfolio",
+            "holdings",
+            "positions",
+            "position list",
+            "allocation",
+            "pnl",
+            "p&l",
+            "account",
+        ),
+    ),
+    (
+        "market_research",
+        (
+            "market",
+            "research",
+            "catalyst",
+            "earnings",
+            "macro",
+            "news",
+            "why is",
+            "what happened",
+            "ticker",
+        ),
+    ),
+    (
+        "calendar_or_ops",
+        (
+            "calendar",
+            "schedule",
+            "remind",
+            "meeting",
+            "agenda",
+            "follow up at",
+        ),
+    ),
+    (
+        "delegation_or_followup",
+        (
+            "delegate",
+            "assign",
+            "follow up",
+            "task",
+            "check on",
+            "coordinate",
+        ),
+    ),
+)
+
+TASK_PRIORITY = (
+    "unsafe_or_regulated_request",
+    "journal_or_review",
+    "trade_idea",
+    "risk_review",
+    "portfolio_check",
+    "market_research",
+    "calendar_or_ops",
+    "delegation_or_followup",
+)
+
+TASK_OVERRIDES = (
+    ("portfolio_check", ("positions and exposure", "portfolio risk", "account exposure", "account-level risk")),
+    ("delegation_or_followup", ("delegate", "assign", "task handoff", "check on", "coordinate")),
+    ("calendar_or_ops", ("follow up at", "calendar block", "calendar my", "remind me", "reminder", "meeting agenda", "schedule")),
+    ("risk_review", ("thesis unacceptable",)),
+)
+
+
+STEERING_POLICIES = {
+    "unsafe_or_regulated_request": (
+        "Do not execute trades, guarantee outcomes, or present certainty. "
+        "Redirect to an educational, risk-aware framing and ask for missing constraints."
+    ),
+    "trade_idea": (
+        "Separate setup, evidence, invalidation, risk, and decision criteria. "
+        "Ask for time horizon, current position, max loss, and position sizing when missing."
+    ),
+    "risk_review": (
+        "Prioritize downside, exposure, invalidation, concentration, and what would make the idea unacceptable."
+    ),
+    "journal_or_review": (
+        "Create a clean decision journal with context, thesis, emotion, lesson, and follow-up action."
+    ),
+    "portfolio_check": (
+        "Separate known portfolio facts from assumptions. Ask for missing holdings, sizing, and objectives before conclusions."
+    ),
+    "market_research": (
+        "Summarize facts, likely drivers, uncertainty, and what evidence would change the view."
+    ),
+    "calendar_or_ops": (
+        "Act as chief of staff: clarify owner, deadline, priority, and next follow-up."
+    ),
+    "delegation_or_followup": (
+        "Clarify desired outcome, owner, status, deadline, and escalation path before dispatching or reporting."
+    ),
+    "general_chief_of_staff": (
+        "Be concise, structured, and action-oriented. Identify the likely objective and ask only for missing critical context."
+    ),
+}
+
+RESPONSE_CONTRACTS = {
+    "unsafe_or_regulated_request": "refuse_or_reframe_to_risk_process",
+    "trade_idea": "setup_evidence_catalyst_entry_invalidation_risk_next_check",
+    "risk_review": "downside_exposure_invalidation_sizing_review",
+    "journal_or_review": "date_context_thesis_emotion_lesson_follow_up",
+    "portfolio_check": "known_facts_assumptions_exposure_objective_next_question",
+    "market_research": "facts_drivers_uncertainty_data_freshness_next_evidence",
+    "calendar_or_ops": "owner_deadline_priority_next_follow_up",
+    "delegation_or_followup": "outcome_owner_status_deadline_escalation",
+    "general_chief_of_staff": "brief_answer_objective_next_action",
+}
+
+ACTION_GATES = {
+    "unsafe_or_regulated_request": "unsafe_or_regulated_request",
+    "trade_idea": "trading_analysis_read_only",
+    "risk_review": "trading_analysis_read_only",
+    "journal_or_review": "journal_review",
+    "portfolio_check": "trading_analysis_read_only",
+    "market_research": "read_only_research",
+    "calendar_or_ops": "calendar_admin",
+    "delegation_or_followup": "delegation_followup",
+    "general_chief_of_staff": "general_assistant",
+}
+
+MISSING_CONSTRAINTS = {
+    "unsafe_or_regulated_request": ("safe framing", "risk limit", "decision criteria"),
+    "trade_idea": ("time horizon", "current position", "max loss", "position size"),
+    "risk_review": ("current position", "exposure", "max loss"),
+    "journal_or_review": ("ticker or theme", "thesis", "lesson"),
+    "portfolio_check": ("holdings", "position sizes", "objective"),
+    "market_research": ("data source", "timestamp", "ticker or theme"),
+    "calendar_or_ops": ("owner", "deadline", "priority"),
+    "delegation_or_followup": ("desired outcome", "owner", "deadline"),
+    "general_chief_of_staff": ("objective",),
+}
+
+
+def _timezone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def classify_task(user_message: str) -> str:
+    text = (user_message or "").lower()
+    rule_map = dict(TASK_RULES)
+    for task_type in ("unsafe_or_regulated_request",):
+        keywords = rule_map[task_type]
+        if any(_contains_keyword(text, keyword) for keyword in keywords):
+            return task_type
+    for task_type, keywords in TASK_OVERRIDES:
+        if any(_contains_keyword(text, keyword) for keyword in keywords):
+            return task_type
+    for task_type in TASK_PRIORITY:
+        if task_type == "unsafe_or_regulated_request":
+            continue
+        keywords = rule_map[task_type]
+        if any(_contains_keyword(text, keyword) for keyword in keywords):
+            return task_type
+    return "general_chief_of_staff"
+
+
+def normalize_input(user_message: str) -> dict[str, object]:
+    task_type = classify_task(user_message)
+    return {
+        "detected_intent": task_type,
+        "action_gate": ACTION_GATES[task_type],
+        "confidence": "low" if task_type == "general_chief_of_staff" else "medium",
+        "missing_constraints": MISSING_CONSTRAINTS[task_type],
+        "suggested_response_contract": RESPONSE_CONTRACTS[task_type],
+        "advisory_only": True,
+    }
+
+
+def _contains_keyword(text: str, keyword: str) -> bool:
+    escaped = re.escape(keyword.lower())
+    if keyword[:1].isalnum() and keyword[-1:].isalnum():
+        return re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text) is not None
+    return keyword.lower() in text
+
+
+def market_session(now: datetime) -> str:
+    if now.weekday() >= 5:
+        return "weekend"
+    current = now.time()
+    if wall_time(4, 0) <= current < wall_time(9, 30):
+        return "premarket"
+    if wall_time(9, 30) <= current < wall_time(16, 0):
+        return "regular_hours"
+    if wall_time(16, 0) <= current < wall_time(20, 0):
+        return "after_hours"
+    return "market_closed"
+
+
+def _context_excerpt(filename: str) -> str:
+    path = AURUM_CONTEXT_DIR / filename
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    lines = []
+    capture = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith("## context hook summary"):
+            capture = True
+            continue
+        if capture and lowered.startswith("## "):
+            break
+        if capture:
+            cleaned = " ".join(line.lstrip("-*0123456789. ").split())
+            if cleaned:
+                lines.append(cleaned)
+
+    if not lines:
+        lines = [" ".join(line.strip().split()) for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+    excerpt = "; ".join(lines)
+    return excerpt[:AURUM_CONTEXT_MAX_CHARS]
+
+
+def _profile_context_lines(task_type: str) -> list[str]:
+    if task_type not in CONTEXT_PROFILE_INTENTS:
+        return []
+
+    lines = [
+        "decision_frame=strategy_adherence_not_trade_advice",
+        "scorecard_dimensions=setup_alignment,catalyst_quality,entry_defined,invalidation_defined,risk_within_policy,timeframe_match,emotional_state_risk,data_freshness",
+    ]
+    skills = _context_excerpt("skills.md")
+    if skills:
+        lines.append(f"skills_md={skills}")
+    trading_system = _context_excerpt("trading_system.md")
+    if trading_system:
+        lines.append(f"trading_system_md={trading_system}")
+    return lines
+
+
+def build_context(user_message: str, *, now: datetime | None = None) -> str:
+    local_tz = _timezone(DEFAULT_TIMEZONE)
+    local_now = (now or datetime.now(timezone.utc)).astimezone(local_tz)
+    utc_now = local_now.astimezone(timezone.utc)
+    normalized = normalize_input(user_message)
+    task_type = str(normalized["detected_intent"])
+
+    return "\n".join(
+        (
+            "BEGIN_AURUM_STEERING_CONTEXT",
+            f"profile={PROFILE}",
+            f"time_local={local_now.isoformat()} time_utc={utc_now.isoformat()} timezone={DEFAULT_TIMEZONE} weekday={local_now.strftime('%A')} market_session={market_session(local_now)} clock_only=true",
+            f"intent={task_type} confidence={normalized['confidence']} advisory_only=true",
+            "priority=raw_user_message_and_history guardrails=cannot_place_or_execute_orders,no_guaranteed_outcomes,no_trade_commands,separate_facts_risk_next_action",
+            *_profile_context_lines(task_type),
+            "END_AURUM_STEERING_CONTEXT",
+        )
+    )
+
+
+def inject_aurum_steering(user_message: str = "", **kwargs):
+    try:
+        return {"context": build_context(user_message)}
+    except Exception:
+        LOGGER.exception("Aurum steering injection failed")
+        return None
+
+
+def register(ctx):
+    ctx.register_hook("pre_llm_call", inject_aurum_steering)

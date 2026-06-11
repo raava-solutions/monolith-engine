@@ -1,0 +1,24 @@
+toolsets:
+- hermes-cli
+- fleet-api-mcp
+mcp_servers:
+  monolith-fleet:
+    enabled: true
+    url: {{ fleet_api_url | default('https://api.fleetos.raavasolutions.com') }}/mcp
+    headers:
+      Authorization: "Bearer ${FLEET_API_TOKEN}"
+policy:
+  write_mode: {{ write_mode | default('proposal_only') }}
+  allowed_actions:
+    - read
+    - propose
+    - query
+  proposal_required_actions:
+    - execute
+    - modify
+    - restart
+    - scale
+  denied_actions:
+    - destroy_without_rollback
+    - expose_secrets
+    - cross_tenant_access

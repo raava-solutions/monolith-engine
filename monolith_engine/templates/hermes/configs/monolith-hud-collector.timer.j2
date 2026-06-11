@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Monolith Hermes HUD Collector — {{ agent_name }}
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec={{ hud_sample_interval_seconds | default(60) }}s
+AccuracySec=15s
+Unit=monolith-hud-collector.service
+
+[Install]
+WantedBy=timers.target

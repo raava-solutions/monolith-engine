@@ -1,0 +1,229 @@
+name: envoy
+display_name: Envoy Paperclip FDE
+description: 'Hermes-based Monolith operator for the Paperclip company fleet'
+version: '0.2.0'
+visibility: admin
+base_image: raava-hermes-golden
+service_name: hermes-gateway
+
+defaults:
+  memory: '4GB'
+  cpu: '2'
+  disk: '30GB'
+  model_provider: openrouter
+  model: 'minimax/minimax-m2.5'
+  timezone: 'America/New_York'
+  personality: 'professional'
+  runtime_envelope: hermes_alpha
+  hermes_home: '/home/agent/.hermes'
+  runtime_gateway_service: hermes-gateway
+  runtime_persistent_paths: '/home/agent/.hermes,/home/agent/.config/hermes,/home/agent/workspace'
+  runtime_health_command: 'systemctl is-active --quiet hermes-gateway && test -d /home/agent/.hermes'
+  install_extras: messaging
+  envoy_delegate_task_limit: 3
+  a2a_discord_enabled: false
+  a2a_discord_max_turns: 12
+  a2a_discord_idle_seconds: 900
+  paperclip_operator_auth_mode: operator
+
+fields:
+  - name: model
+    type: string
+    required: true
+    description: 'LLM model ID on OpenRouter'
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+    description: 'Model provider: openrouter, moonshot, minimax'
+  - name: timezone
+    type: string
+    required: false
+    default: 'America/New_York'
+  - name: personality
+    type: string
+    required: false
+    default: professional
+  - name: discord_channel
+    type: string
+    required: false
+    description: 'Discord home channel ID where @envoy is reached'
+  - name: discord_guild_id
+    type: string
+    required: false
+    description: 'Discord server/guild ID for the deployed @envoy bot'
+  - name: discord_free_response_channels
+    type: string
+    required: false
+    description: 'Comma-separated Discord channel IDs where @envoy may respond without a direct mention'
+  - name: discord_allowed_users
+    type: string
+    required: false
+    description: 'Comma-separated Discord user or bot IDs allowed to interact with @envoy'
+  - name: a2a_discord_enabled
+    type: boolean
+    required: false
+    default: false
+    description: 'Enable Discord-based agent-to-agent coordination guardrails'
+  - name: a2a_discord_channel_id
+    type: string
+    required: false
+    description: 'Dedicated Discord channel ID for Envoy agent-to-agent coordination'
+  - name: a2a_discord_peer_name
+    type: string
+    required: false
+    default: argus
+    description: 'Expected peer agent name for Discord A2A coordination'
+  - name: a2a_discord_peer_user_id
+    type: string
+    required: false
+    description: 'Discord bot user ID for the A2A peer agent'
+  - name: a2a_discord_max_turns
+    type: integer
+    required: false
+    default: 12
+    description: 'Maximum total agent turns in one Discord A2A thread before Envoy summarizes and stops'
+  - name: a2a_discord_idle_seconds
+    type: integer
+    required: false
+    default: 900
+    description: 'Idle timeout in seconds for a Discord A2A thread'
+  - name: secrets_mode
+    type: string
+    required: false
+    default: 'env'
+    enum: [env, none]
+    description: 'How runtime secrets are injected'
+  - name: hermes_ref
+    type: string
+    required: false
+    default: '498bfc7bc12a937621b4215312049b1000726df3'
+    description: 'Git ref to clone for hermes-agent'
+  - name: install_extras
+    type: string
+    required: false
+    default: 'messaging'
+    description: 'pip extras to install'
+  - name: paperclip_operator_api_url
+    type: string
+    required: false
+    description: 'Direct Paperclip API root, including /api if required by the Paperclip deployment'
+  - name: paperclip_operator_auth_mode
+    type: string
+    required: false
+    default: operator
+    enum: [operator, company_keys]
+    description: 'operator uses a single Paperclip operator credential; company_keys uses explicit N-key pivot fallback'
+  - name: paperclip_operator_api_key
+    type: string
+    required: false
+    description: 'Paperclip operator-scoped API key. Prefer passing as a manifest secret.'
+  - name: paperclip_company_keys_json
+    type: string
+    required: false
+    description: 'Fallback JSON map of company_id to company-scoped Paperclip API key'
+  - name: paperclip_company_registry_json
+    type: string
+    required: false
+    description: 'Optional JSON array of companies Envoy may manage when using company-key pivoting'
+  - name: linear_argus_project_key
+    type: string
+    required: false
+    default: Argus
+    description: 'Human label for the Linear project or queue watched by Argus'
+  - name: runtime_envelope
+    type: string
+    required: false
+    default: hermes_alpha
+    enum: [hermes_alpha]
+  - name: hermes_home
+    type: string
+    required: false
+    default: '/home/agent/.hermes'
+  - name: runtime_gateway_service
+    type: string
+    required: false
+    default: hermes-gateway
+  - name: runtime_persistent_paths
+    type: string
+    required: false
+    default: '/home/agent/.hermes,/home/agent/.config/hermes,/home/agent/workspace'
+  - name: runtime_sidecar_services
+    type: string
+    required: false
+    default: ''
+  - name: runtime_health_command
+    type: string
+    required: false
+    default: 'systemctl is-active --quiet hermes-gateway && test -d /home/agent/.hermes'
+  - name: hud_enabled
+    type: boolean
+    required: false
+    default: true
+  - name: hud_ingest_url
+    type: string
+    required: false
+  - name: hud_ingest_api_key
+    type: string
+    required: false
+  - name: hud_sample_interval_seconds
+    type: integer
+    required: false
+    default: 60
+  - name: trace_enabled
+    type: boolean
+    required: false
+    default: false
+  - name: observability_proxy_url
+    type: string
+    required: false
+  - name: trace_ingest_url
+    type: string
+    required: false
+  - name: otel_exporter_otlp_endpoint
+    type: string
+    required: false
+
+secret_slots:
+  - env_var: OPENROUTER_API_KEY
+    required: true
+    description: 'API key for the model provider'
+  - env_var: DISCORD_BOT_TOKEN
+    required: false
+    integration: discord
+  - env_var: PAPERCLIP_OPERATOR_API_KEY
+    required: false
+    description: 'Single operator-scoped Paperclip credential'
+  - env_var: PAPERCLIP_COMPANY_KEYS_JSON
+    required: false
+    description: 'Fallback company-scoped key map for explicit N-key pivoting'
+  - env_var: MONOLITH_TRACE_INGEST_API_KEY
+    required: false
+    integration: observability
+  - env_var: MONOLITH_HUD_INGEST_API_KEY
+    required: false
+    integration: observability
+
+integrations:
+  - name: discord
+    description: 'Discord mention surface for @envoy'
+    secrets:
+      - key: DISCORD_BOT_TOKEN
+        op_ref: 'op://{vault}/Discord Bot Token/credential'
+  - name: observability
+    description: 'Monolith trace ingest and HUD wiring'
+    secrets:
+      - key: MONOLITH_TRACE_INGEST_API_KEY
+        op_ref: 'op://{vault}/Monolith Trace Ingest API Key/credential'
+      - key: MONOLITH_HUD_INGEST_API_KEY
+        op_ref: 'op://{vault}/Monolith HUD Ingest API Key/credential'
+
+health_check: "pgrep -f 'hermes_cli.main gateway'"
+
+providers:
+  lxd:
+    image: raava-hermes-golden
+  gce:
+    machine_image: raava-base-hermes
+    machine_type: e2-small
+    disk_size_gb: 50

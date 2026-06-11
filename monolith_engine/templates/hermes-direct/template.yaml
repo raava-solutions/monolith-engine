@@ -1,0 +1,90 @@
+name: hermes-direct
+display_name: Hermes Agent (Direct Env)
+description: "Hermes agent template without mandatory 1Password runtime wrapping"
+version: "2026.3.28"
+visibility: admin
+base_image: agent-golden-image
+service_name: hermes-gateway
+
+defaults:
+  memory: "4GB"
+  cpu: "2"
+  disk: "30GB"
+  model_provider: openrouter
+  model: "minimax/minimax-m2.5"
+  timezone: "America/New_York"
+  personality: "professional"
+  # secrets_mode selects the runtime secrets posture (credentials-vault KTD6):
+  #   env    — compatibility lane: provider key rendered into the guest env.
+  #   bridge — no provider key in the guest; the host-side LLM gateway attaches
+  #            it at call time and the run token (RAAVA_RUN_TOKEN) is injected at
+  #            microVM create. Bridge mode requires the raava pool provider.
+  # Default is the compatibility lane until per-template cutover is verified;
+  # flip to bridge here (or pass secrets_mode=bridge per request) to cut over.
+  secrets_mode: env
+  # Run-token spend caps (CAPS unit / review P0 #5, P1 #10). Consumed only in
+  # bridge mode, where the host-side LLM gateway enforces them per run,
+  # deny-by-default (unset/zero refuses every brokered model call). This is the
+  # template ceiling — a request may lower it but never raise it; tier resolution
+  # (Starter $2 / Pro $10 / Enterprise $25) sets the default when no template
+  # knob is present. Pro-grade default here.
+  run_token_budget_usd: 10.00
+  run_token_rate_limit_per_min: 120
+
+# Bridge-mode runtime config (credentials-vault §U4/§U5). Consumed only when
+# secrets_mode=bridge. Default-deny egress lets the guest reach the bridge LLM
+# gateway + DNS; allowlist adds explicit per-template destinations.
+bridge:
+  allowlist: []
+
+fields:
+  - name: model
+    type: string
+    required: true
+    description: "LLM model ID on OpenRouter"
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+    description: "Model provider: openrouter, moonshot, minimax, ollama, endpoint (local OpenAI-compatible)"
+  - name: model_base_url
+    type: string
+    required: false
+    description: "OpenAI-compatible base URL for local model providers (ollama, endpoint), e.g. http://host.docker.internal:11434/v1"
+  - name: openrouter_api_key
+    type: string
+    required: false
+    description: "Optional direct OpenRouter API key for non-1Password runtime"
+  - name: system_prompt
+    type: text
+    required: false
+    description: "Custom SOUL.md content. Uses a default professional template if omitted."
+  - name: timezone
+    type: string
+    required: false
+    default: "America/New_York"
+  - name: personality
+    type: string
+    required: false
+    default: professional
+    description: "Agent personality style: professional, kawaii, concise"
+  - name: discord_channel
+    type: string
+    required: false
+    description: "Discord home channel ID for this agent"
+
+integrations: []
+
+health_check: "pgrep -f 'hermes_cli.main gateway'"
+
+providers:
+  lxd:
+    image: agent-golden-image
+  gce:
+    machine_image: raava-base-hermes
+    machine_type: e2-small
+    disk_size_gb: 50
+  docker:
+    image: monolith-hermes-golden:latest
+  raava:
+    image: agent-golden-image

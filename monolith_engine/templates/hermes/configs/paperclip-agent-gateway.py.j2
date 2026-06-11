@@ -1,0 +1,3220 @@
+import errno
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import signal
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LOG_PATH = "/var/log/paperclip-agent-gateway/wakeups.jsonl"
+LOCK_DIR = "/var/lock/paperclip-agent-gateway"
+REPLAY_DIR = os.environ.get("PAPERCLIP_GATEWAY_REPLAY_DIR", "/home/agent/.paperclip-agent-gateway/replay")
+GATEWAY_MODE = (os.environ.get("PAPERCLIP_GATEWAY_MODE") or "sync").strip().lower()
+QUEUE_DIR = os.environ.get(
+    "PAPERCLIP_GATEWAY_QUEUE_DIR",
+    "/home/agent/.paperclip-agent-gateway/queue",
+)
+WORKER_POLL_SEC = float(os.environ.get("PAPERCLIP_GATEWAY_WORKER_POLL_SEC", "1.0"))
+SECRET = (os.environ.get("PAPERCLIP_GATEWAY_SECRET") or "").strip()
+if not SECRET:
+    raise RuntimeError("PAPERCLIP_GATEWAY_SECRET must be configured")
+HMAC_SECRET = (os.environ.get("PAPERCLIP_GATEWAY_HMAC_SECRET") or SECRET).strip()
+REQUIRE_HMAC = (os.environ.get("PAPERCLIP_GATEWAY_REQUIRE_HMAC") or "true").strip().lower() not in ("0", "false", "no", "off")
+SIGNATURE_TOLERANCE_SEC = int(os.environ.get("PAPERCLIP_GATEWAY_SIGNATURE_TOLERANCE_SEC", "300"))
+HERMES_TIMEOUT_SEC = int(os.environ.get("PAPERCLIP_HERMES_TIMEOUT_SEC", "600"))
+LOCK_WAIT_SEC = float(os.environ.get("PAPERCLIP_LOCK_WAIT_SEC", "420"))
+ROUTINE_CONTRACTS_PATH = "/home/agent/.hermes/routine-contracts.yaml"
+SOURCE_OF_TRUTH_PATH = "/home/agent/.hermes/source-of-truth/finance/trading"
+TOOL_CALL_PREFIX = "PAPERCLIP_TOOL_CALL:"
+ALLOWED_TOOL_NAMES = (
+    "paperclip_get_me",
+    "paperclip_get_inbox",
+    "paperclip_list_agents",
+    "paperclip_get_agent",
+    "paperclip_get_org",
+    "paperclip_get_dashboard",
+    "paperclip_get_activity",
+    "paperclip_list_tasks",
+    "paperclip_get_task",
+    "paperclip_get_task_comments",
+    "paperclip_list_task_documents",
+    "paperclip_get_task_document",
+    "paperclip_put_task_document",
+    "paperclip_create_task",
+    "paperclip_delegate_to_report",
+    "paperclip_checkout_task",
+    "paperclip_release_task",
+    "paperclip_update_task",
+    "paperclip_comment_on_task",
+    "paperclip_report_to_manager",
+    "paperclip_get_my_tasks",
+    "paperclip_get_created_tasks",
+    "paperclip_list_goals",
+    "paperclip_get_goal",
+    "paperclip_create_goal",
+    "paperclip_update_goal",
+    "paperclip_list_projects",
+    "paperclip_get_project",
+    "paperclip_create_project",
+    "paperclip_update_project",
+    "paperclip_create_routine",
+    "paperclip_list_routines",
+    "paperclip_get_routine",
+    "paperclip_update_routine",
+    "paperclip_create_routine_trigger",
+    "paperclip_update_routine_trigger",
+    "paperclip_delete_routine_trigger",
+    "paperclip_run_routine",
+    "paperclip_list_approvals",
+    "paperclip_get_approval",
+    "paperclip_request_approval",
+    "paperclip_get_approval_issues",
+    "paperclip_get_approval_comments",
+    "paperclip_comment_on_approval",
+)
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_PROMPT_CONTEXT_KEYS = (
+    "taskId",
+    "wakeReason",
+    "commentId",
+    "actorId",
+    "triggeredBy",
+    "wakeSource",
+    "wakeTriggerDetail",
+)
+
+
+def _allowed_tools_text():
+    return ", ".join(ALLOWED_TOOL_NAMES)
+
+
+def _forwarded_env():
+    allowed_prefixes = (
+        "MONOLITH_",
+        "PAPERCLIP_",
+        "SUPERMEMORY_",
+        "OPENROUTER_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "GEMINI_",
+    )
+    allowed_names = {
+        "MODEL",
+        "HERMES_MODEL",
+        "HERMES_PROVIDER",
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_HOME_CHANNEL",
+        "DISCORD_ALLOWED_USERS",
+        "DISCORD_HOME_CHANNEL_NAME",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_REQUIRE_MENTION",
+        "DISCORD_APPLICATION_ID",
+        "DISCORD_GUILD_ID",
+        "TELEGRAM_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+    }
+    forwarded = {}
+    for key, value in sorted(os.environ.items()):
+        if key in allowed_names or key.startswith(allowed_prefixes):
+            forwarded[key] = value
+    return forwarded
+
+
+def _payload_context_env(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    env = {}
+    mappings = {
+        "PAPERCLIP_RUN_ID": payload.get("runId"),
+        "PAPERCLIP_AGENT_ID": payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID"),
+        "PAPERCLIP_COMPANY_ID": payload.get("companyId") or os.environ.get("PAPERCLIP_COMPANY_ID"),
+        "PAPERCLIP_TASK_ID": context.get("taskId") or payload.get("taskId"),
+        "PAPERCLIP_WAKE_REASON": context.get("wakeReason") or payload.get("wakeReason"),
+        "PAPERCLIP_COMMENT_ID": context.get("commentId") or payload.get("commentId"),
+        "MONOLITH_LOGICAL_AGENT_ID": payload.get("logicalAgentId") or os.environ.get("MONOLITH_LOGICAL_AGENT_ID"),
+        "MONOLITH_BRAIN_ID": payload.get("brainId") or os.environ.get("MONOLITH_BRAIN_ID"),
+    }
+    for key, value in mappings.items():
+        if value is not None and str(value).strip():
+            env[key] = str(value)
+    return env
+
+
+def _hermes_env(payload):
+    env = _forwarded_env()
+    env.update(_payload_context_env(payload))
+    env.update(
+        {
+            "HOME": "/home/agent",
+            "HERMES_HOME": "/home/agent/.hermes",
+            "PATH": "/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+    )
+    return env
+
+
+def _compact_prompt_context(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    compact = {
+        key: context.get(key)
+        for key in _PROMPT_CONTEXT_KEYS
+        if context.get(key) not in (None, "", [], {})
+    }
+
+    workspace = context.get("paperclipWorkspace")
+    if isinstance(workspace, dict):
+        compact["paperclipWorkspace"] = {
+            key: workspace.get(key)
+            for key in (
+                "cwd",
+                "mode",
+                "source",
+                "repoRef",
+                "repoUrl",
+                "projectId",
+                "branchName",
+            )
+            if workspace.get(key) not in (None, "", [], {})
+        }
+
+    environment = context.get("paperclipEnvironment")
+    if isinstance(environment, dict):
+        compact["paperclipEnvironment"] = {
+            key: environment.get(key)
+            for key in ("id", "name", "driver")
+            if environment.get(key) not in (None, "", [], {})
+        }
+
+    return compact
+
+
+def _api_root():
+    return (os.environ.get("PAPERCLIP_API_URL") or "").strip().rstrip("/")
+
+
+def _api_key(agent_id=None):
+    key_map_raw = (os.environ.get("PAPERCLIP_AGENT_API_KEYS_JSON") or "").strip()
+    if key_map_raw and agent_id:
+        try:
+            key_map = json.loads(key_map_raw)
+        except json.JSONDecodeError:
+            key_map = {}
+        if isinstance(key_map, dict):
+            mapped = str(key_map.get(str(agent_id)) or "").strip()
+            if mapped:
+                return mapped
+    return (os.environ.get("PAPERCLIP_API_KEY") or "").strip()
+
+
+def _header(headers, name):
+    return (
+        headers.get(name)
+        or headers.get(name.lower())
+        or headers.get("-".join(part.capitalize() for part in name.split("-")))
+        or ""
+    )
+
+
+def _signature_hex(value):
+    text = str(value or "").strip()
+    if text.startswith("sha256="):
+        return text.split("=", 1)[1].strip().lower()
+    return text.lower()
+
+
+def _gateway_signature(timestamp, raw_body):
+    body = raw_body if isinstance(raw_body, bytes) else bytes(raw_body or b"")
+    signed = str(timestamp).encode("utf-8") + b"." + body
+    return hmac.new(HMAC_SECRET.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+
+
+def _record_replay_nonce(nonce):
+    safe = hashlib.sha256(str(nonce).encode("utf-8")).hexdigest()
+    os.makedirs(REPLAY_DIR, exist_ok=True)
+    cutoff = time.time() - (SIGNATURE_TOLERANCE_SEC * 2)
+    try:
+        for entry in os.scandir(REPLAY_DIR):
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+    path = os.path.join(REPLAY_DIR, safe)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
+    return True
+
+
+def _verify_request_auth(headers, raw_body):
+    shared_secret = _header(headers, "x-paperclip-gateway-secret")
+    if not hmac.compare_digest(shared_secret, SECRET):
+        return "unauthorized"
+
+    signature = _header(headers, "x-paperclip-signature")
+    if not signature and not REQUIRE_HMAC:
+        return None
+    if not signature:
+        return "missing_signature"
+
+    timestamp = _header(headers, "x-paperclip-timestamp")
+    try:
+        timestamp_sec = int(str(timestamp))
+    except (TypeError, ValueError):
+        return "invalid_signature_timestamp"
+    if abs(time.time() - timestamp_sec) > SIGNATURE_TOLERANCE_SEC:
+        return "stale_signature"
+
+    expected = _gateway_signature(timestamp, raw_body)
+    if not hmac.compare_digest(_signature_hex(signature), expected):
+        return "invalid_signature"
+
+    replay_key = _header(headers, "x-paperclip-idempotency-key") or f"{timestamp}:{signature}"
+    if not _record_replay_nonce(replay_key):
+        return "replayed_request"
+    return None
+
+
+class PaperclipRequestError(RuntimeError):
+    def __init__(self, method, path, status, detail):
+        self.method = method
+        self.path = path
+        self.status = status
+        self.detail = detail
+        super().__init__(f"Paperclip {method} {path} returned {status}: {detail[:500]}")
+
+
+def _paperclip_request(method, path, body=None, agent_id=None, run_id=None):
+    root = _api_root()
+    token = _api_key(agent_id)
+    if not root:
+        raise RuntimeError("PAPERCLIP_API_URL is not configured")
+    if not token:
+        raise RuntimeError("PAPERCLIP_API_KEY is not configured")
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json",
+    }
+    if run_id and _UUID_RE.match(str(run_id)):
+        headers["X-Paperclip-Run-Id"] = str(run_id)
+
+    request = urllib.request.Request(
+        f"{root}{path}",
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8")
+            return json.loads(payload) if payload else None
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise PaperclipRequestError(method, path, error.code, detail) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Paperclip {method} {path} failed: {error.reason}") from error
+
+def _clean_text(value, *, max_len):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text[:max_len]
+
+
+def _normalized_agent_id(value, payload):
+    text = _clean_text(value, max_len=128)
+    if not text:
+        return None
+    if text.lower() == "self":
+        return payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID")
+    return text
+
+
+def _normal_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+REPORT_CONTRACT_V1_KEY = "report-contract-v1"
+
+
+def _document_key_from_call(call, payload):
+    args = (
+        call.get("args")
+        if isinstance(call.get("args"), dict)
+        else call.get("params")
+        if isinstance(call.get("params"), dict)
+        else call.get("parameters")
+        if isinstance(call.get("parameters"), dict)
+        else call.get("arguments")
+        if isinstance(call.get("arguments"), dict)
+        else {}
+    )
+    key = _clean_text(_first_arg(args, "key", "document_key", "documentKey"), max_len=240)
+    declared_key = _payload_report_document_key(payload)
+    return key or declared_key
+
+
+def _canonical_tool_name(call):
+    tool = _clean_text(call.get("tool") or call.get("name") or call.get("action"), max_len=80)
+    tool_aliases = {
+        "get_me": "paperclip_get_me",
+        "get_inbox": "paperclip_get_inbox",
+        "get_agent": "paperclip_get_agent",
+        "list_agents": "paperclip_list_agents",
+        "get_org": "paperclip_get_org",
+        "list_tasks": "paperclip_list_tasks",
+        "create_task": "paperclip_create_task",
+        "delegate_to_report": "paperclip_delegate_to_report",
+        "update_task": "paperclip_update_task",
+        "checkout_task": "paperclip_checkout_task",
+        "release_task": "paperclip_release_task",
+        "create_routine": "paperclip_create_routine",
+        "list_routines": "paperclip_list_routines",
+        "get_routine": "paperclip_get_routine",
+        "update_routine": "paperclip_update_routine",
+        "create_routine_trigger": "paperclip_create_routine_trigger",
+        "update_routine_trigger": "paperclip_update_routine_trigger",
+        "delete_routine_trigger": "paperclip_delete_routine_trigger",
+        "run_routine": "paperclip_run_routine",
+        "comment_on_task": "paperclip_comment_on_task",
+        "report_to_manager": "paperclip_report_to_manager",
+        "get_task": "paperclip_get_task",
+        "get_task_comments": "paperclip_get_task_comments",
+        "get_my_tasks": "paperclip_get_my_tasks",
+        "get_created_tasks": "paperclip_get_created_tasks",
+        "list_goals": "paperclip_list_goals",
+        "get_goal": "paperclip_get_goal",
+        "create_goal": "paperclip_create_goal",
+        "update_goal": "paperclip_update_goal",
+        "list_projects": "paperclip_list_projects",
+        "get_project": "paperclip_get_project",
+        "create_project": "paperclip_create_project",
+        "update_project": "paperclip_update_project",
+        "list_approvals": "paperclip_list_approvals",
+        "get_approval": "paperclip_get_approval",
+        "request_approval": "paperclip_request_approval",
+        "get_approval_issues": "paperclip_get_approval_issues",
+        "get_approval_comments": "paperclip_get_approval_comments",
+        "comment_on_approval": "paperclip_comment_on_approval",
+        "get_dashboard": "paperclip_get_dashboard",
+        "get_activity": "paperclip_get_activity",
+        "list_task_documents": "paperclip_list_task_documents",
+        "get_task_document": "paperclip_get_task_document",
+        "put_task_document": "paperclip_put_task_document",
+    }
+    return tool_aliases.get(tool, tool)
+
+
+def _payload_task_id(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    return context.get("taskId") or payload.get("taskId")
+
+
+def _first_arg(args, *names, default=None):
+    for name in names:
+        value = args.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    return default
+
+
+def _current_agent_id(payload):
+    return payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID")
+
+
+def _clean_status_list(value, *, default, allowed=None):
+    raw = value if value not in (None, "", [], {}) else default
+    if isinstance(raw, str):
+        items = [item.strip().lower() for item in raw.split(",")]
+    elif isinstance(raw, list):
+        items = [str(item).strip().lower() for item in raw]
+    else:
+        items = [str(raw).strip().lower()]
+    normalized = []
+    for item in items:
+        if not item or item in normalized:
+            continue
+        if allowed and item not in allowed:
+            continue
+        normalized.append(item)
+    return normalized
+
+
+def _clean_bool(value, *, default=False):
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def _bounded_limit(value, *, default=50, maximum=100):
+    try:
+        limit = int(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(maximum, limit))
+
+
+def _encoded_query(values):
+    query = {}
+    for key, value in values.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            query[key] = ",".join(str(item) for item in value if str(item).strip())
+        else:
+            query[key] = value
+    return urllib.parse.urlencode(query)
+
+
+def _issue_id_arg(args, payload, tool):
+    issue_id = _clean_text(
+        _first_arg(
+            args,
+            "issue_id",
+            "issueId",
+            "task_id",
+            "taskId",
+            "id",
+            default=_payload_task_id(payload),
+        ),
+        max_len=128,
+    )
+    if not issue_id:
+        raise RuntimeError(f"{tool} requires issue_id")
+    return issue_id
+
+
+def _routine_id_arg(args, tool):
+    routine_id = _clean_text(
+        _first_arg(args, "routine_id", "routineId", "id"),
+        max_len=128,
+    )
+    if not routine_id:
+        raise RuntimeError(f"{tool} requires routine_id")
+    return routine_id
+
+
+def _trigger_id_arg(args, tool):
+    trigger_id = _clean_text(
+        _first_arg(args, "trigger_id", "triggerId", "id"),
+        max_len=128,
+    )
+    if not trigger_id:
+        raise RuntimeError(f"{tool} requires trigger_id")
+    return trigger_id
+
+
+def _copy_clean_fields(args, field_map, *, max_len=8000):
+    body = {}
+    for source_keys, target_key in field_map:
+        value = _first_arg(args, *source_keys)
+        if isinstance(value, (dict, list, bool, int, float)):
+            body[target_key] = value
+            continue
+        cleaned = _clean_text(value, max_len=max_len)
+        if cleaned:
+            body[target_key] = cleaned
+    return body
+
+
+def _clean_text_items(value, *, max_items=12, max_len=500):
+    if value in (None, "", [], {}):
+        return []
+    if isinstance(value, str):
+        raw_items = [line.strip(" -\t") for line in value.splitlines()]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = [value]
+    items = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            label = (
+                item.get("title")
+                or item.get("name")
+                or item.get("key")
+                or item.get("document_key")
+                or item.get("documentKey")
+                or item.get("description")
+            )
+            detail = item.get("purpose") or item.get("format") or item.get("review")
+            text = f"{label}: {detail}" if label and detail else label
+        else:
+            text = item
+        cleaned = _clean_text(text, max_len=max_len)
+        if cleaned:
+            items.append(cleaned)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _delegation_contract_from_args(args):
+    work_mode = _clean_text(_first_arg(args, "work_mode", "workMode", "mode"), max_len=80).lower()
+    owner = _clean_text(_first_arg(args, "owner", "owner_agent", "ownerAgent"), max_len=160)
+    acceptance = _clean_text_items(
+        _first_arg(args, "acceptance_criteria", "acceptanceCriteria", "acceptance"),
+        max_items=10,
+    )
+    expected_documents = _clean_text_items(
+        _first_arg(args, "expected_documents", "expectedDocuments", "documents"),
+        max_items=8,
+    )
+    blocker_policy = _clean_text_items(
+        _first_arg(args, "blocker_policy", "blockerPolicy", "blockers"),
+        max_items=8,
+    )
+    review_policy = _clean_text_items(
+        _first_arg(args, "review_policy", "reviewPolicy", "review"),
+        max_items=8,
+    )
+
+    if not any([work_mode, owner, acceptance, expected_documents, blocker_policy, review_policy]):
+        return ""
+
+    lines = ["## Monolith Paperclip Delegation Contract"]
+    if work_mode:
+        lines.append(f"- work_mode: {work_mode}")
+    if owner:
+        lines.append(f"- owner: {owner}")
+    if acceptance:
+        lines.append("- acceptance_criteria:")
+        lines.extend([f"  - {item}" for item in acceptance])
+    if expected_documents:
+        lines.append("- expected_output_documents:")
+        lines.extend([f"  - {item}" for item in expected_documents])
+    if blocker_policy:
+        lines.append("- blocker_policy:")
+        lines.extend([f"  - {item}" for item in blocker_policy])
+    if review_policy:
+        lines.append("- review_policy:")
+        lines.extend([f"  - {item}" for item in review_policy])
+    if work_mode == "planning":
+        lines.append("- planning_rule: do not implement on this issue; create executable child issues after plan acceptance")
+    return "\n".join(lines)
+
+
+def _resolve_report_agent_id(value, payload, company_id):
+    target = _normal_key(value)
+    if not target:
+        return None
+    agents = _paperclip_request(
+        "GET",
+        f"/companies/{urllib.parse.quote(company_id)}/agents",
+        agent_id=payload.get("agentId"),
+    )
+    if not isinstance(agents, list):
+        return None
+    self_agent_id = str(payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID") or "")
+    compact_agents = [agent for agent in agents if isinstance(agent, dict)]
+    direct_reports = [
+        agent for agent in compact_agents if str(agent.get("reportsTo") or "") == self_agent_id
+    ]
+    for scope in (direct_reports, compact_agents):
+        for agent in scope:
+            candidates = (
+                agent.get("id"),
+                agent.get("name"),
+                agent.get("urlKey"),
+                agent.get("title"),
+            )
+            if target in {_normal_key(candidate) for candidate in candidates if candidate}:
+                return agent.get("id")
+    return None
+
+
+def _execute_tool_call(call, payload):
+    if not isinstance(call, dict):
+        raise RuntimeError("Tool call must be a JSON object")
+    tool = _canonical_tool_name(call)
+    args = (
+        call.get("args")
+        if isinstance(call.get("args"), dict)
+        else call.get("params")
+        if isinstance(call.get("params"), dict)
+        else call.get("parameters")
+        if isinstance(call.get("parameters"), dict)
+        else call.get("arguments")
+        if isinstance(call.get("arguments"), dict)
+        else {key: value for key, value in call.items() if key not in {"tool", "name", "action"}}
+    )
+    company_id = _clean_text(
+        args.get("company_id") or payload.get("companyId") or os.environ.get("PAPERCLIP_COMPANY_ID"),
+        max_len=128,
+    )
+    run_id = payload.get("runId")
+    if not company_id:
+        raise RuntimeError("Paperclip company id is required")
+
+    if tool == "paperclip_get_me":
+        return _paperclip_request("GET", "/agents/me", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_get_inbox":
+        return _paperclip_request("GET", "/agents/me/inbox-lite", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_list_agents":
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/agents",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_agent":
+        agent_id = _normalized_agent_id(
+            _first_arg(args, "agent_id", "agentId", "id", default="self"),
+            payload,
+        )
+        return _paperclip_request(
+            "GET",
+            f"/agents/{urllib.parse.quote(str(agent_id))}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_org":
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/org",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_dashboard":
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/dashboard",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_activity":
+        query = _encoded_query({"limit": _bounded_limit(args.get("limit"), default=50, maximum=100)})
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/activity?{query}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_list_tasks":
+        agent_id = _normalized_agent_id(
+            _first_arg(args, "assignee_agent_id", "assigneeAgentId", "agent_id", "agentId"),
+            payload,
+        )
+        participant_agent_id = _normalized_agent_id(
+            _first_arg(args, "participant_agent_id", "participantAgentId"),
+            payload,
+        )
+        query = _encoded_query(
+            {
+                "status": _first_arg(args, "status", "statuses"),
+                "assigneeAgentId": agent_id,
+                "participantAgentId": participant_agent_id,
+                "projectId": _first_arg(args, "project_id", "projectId"),
+                "goalId": _first_arg(args, "goal_id", "goalId"),
+                "parentId": _first_arg(args, "parent_id", "parentId", "parent_issue_id", "parentIssueId"),
+                "q": _first_arg(args, "q", "query", "search"),
+                "limit": _bounded_limit(args.get("limit"), default=50, maximum=100),
+            }
+        )
+        suffix = f"?{query}" if query else ""
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/issues{suffix}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_checkout_task":
+        issue_id = _issue_id_arg(args, payload, tool)
+        expected_statuses = _clean_status_list(
+            _first_arg(args, "expected_statuses", "expectedStatuses", "statuses"),
+            default=["todo", "backlog", "blocked", "in_review"],
+            allowed={"todo", "backlog", "blocked", "in_review", "in_progress"},
+        )
+        body = {
+            "agentId": _current_agent_id(payload),
+            "expectedStatuses": expected_statuses,
+        }
+        return _paperclip_request(
+            "POST",
+            f"/issues/{urllib.parse.quote(issue_id)}/checkout",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_release_task":
+        issue_id = _issue_id_arg(args, payload, tool)
+        body = {"agentId": _current_agent_id(payload)}
+        reason = _clean_text(_first_arg(args, "reason", "body", "comment"), max_len=1000)
+        if reason:
+            body["reason"] = reason
+        return _paperclip_request(
+            "POST",
+            f"/issues/{urllib.parse.quote(issue_id)}/release",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_update_task":
+        issue_id = _issue_id_arg(args, payload, tool)
+        status = _clean_text(_first_arg(args, "status"), max_len=40).lower()
+        if status == "in_progress":
+            raise RuntimeError("paperclip_update_task cannot set in_progress; use paperclip_checkout_task")
+        body = _copy_clean_fields(
+            args,
+            (
+                (("title",), "title"),
+                (("description", "body", "summary"), "description"),
+                (("priority",), "priority"),
+                (("assignee_agent_id", "assigneeAgentId"), "assigneeAgentId"),
+                (("parent_id", "parentId", "parent_issue_id", "parentIssueId"), "parentId"),
+                (("project_id", "projectId"), "projectId"),
+                (("goal_id", "goalId"), "goalId"),
+                (("comment", "message"), "comment"),
+            ),
+        )
+        if status:
+            if status not in {"backlog", "todo", "blocked", "in_review", "done", "cancelled"}:
+                raise RuntimeError("paperclip_update_task received unsupported status")
+            body["status"] = status
+        if not body:
+            raise RuntimeError("paperclip_update_task requires at least one update field")
+        return _paperclip_request(
+            "PATCH",
+            f"/issues/{urllib.parse.quote(issue_id)}",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool in {"paperclip_create_task", "paperclip_delegate_to_report"}:
+        title = _clean_text(args.get("title") or args.get("task_title") or args.get("taskTitle"), max_len=240)
+        description = _clean_text(
+            args.get("description")
+            or args.get("task_description")
+            or args.get("taskDescription")
+            or args.get("instructions")
+            or args.get("body")
+            or args.get("message"),
+            max_len=8000,
+        )
+        delegation_contract = _delegation_contract_from_args(args)
+        if delegation_contract:
+            description = f"{description}\n\n{delegation_contract}" if description else delegation_contract
+        if not title and tool == "paperclip_delegate_to_report":
+            parent_hint = _clean_text(_payload_task_id(payload), max_len=32)
+            title = f"Follow up on Paperclip task {parent_hint}" if parent_hint else "Delegated Paperclip task"
+        if not title:
+            raise RuntimeError("paperclip_create_task requires title")
+        priority = _clean_text(args.get("priority") or "medium", max_len=40).lower()
+        if priority not in {"critical", "low", "medium", "high", "urgent"}:
+            priority = "medium"
+        status = _clean_text(args.get("status") or "todo", max_len=40).lower()
+        if status not in {"backlog", "todo", "in_progress"}:
+            status = "todo"
+        body = {
+            "title": title,
+            "description": description or None,
+            "priority": priority,
+            "status": status,
+        }
+        assignee = _normalized_agent_id(
+            args.get("assignee_agent_id") or args.get("assigneeAgentId") or args.get("report_agent_id") or args.get("reportAgentId"),
+            payload,
+        )
+        if not assignee and tool == "paperclip_delegate_to_report":
+            assignee = _resolve_report_agent_id(
+                args.get("report_name") or args.get("reportName") or args.get("assignee_name") or args.get("assigneeName"),
+                payload,
+                company_id,
+            )
+        if assignee:
+            body["assigneeAgentId"] = assignee
+        parent_id = _clean_text(
+            args.get("parent_id") or args.get("parentId") or args.get("parent_issue_id") or args.get("parentIssueId"),
+            max_len=128,
+        )
+        if not parent_id and tool in {"paperclip_create_task", "paperclip_delegate_to_report"}:
+            parent_id = _clean_text(_payload_task_id(payload), max_len=128)
+        if parent_id:
+            body["parentId"] = parent_id
+        for source_key, target_key in (
+            ("project_id", "projectId"),
+            ("projectId", "projectId"),
+            ("goal_id", "goalId"),
+            ("goalId", "goalId"),
+        ):
+            value = _clean_text(args.get(source_key), max_len=128)
+            if value:
+                body[target_key] = value
+        for source_key, target_key in (
+            ("label_ids", "labelIds"),
+            ("labelIds", "labelIds"),
+            ("blocker_ids", "blockerIds"),
+            ("blockerIds", "blockerIds"),
+        ):
+            value = args.get(source_key)
+            if isinstance(value, list):
+                body[target_key] = [str(item)[:128] for item in value if str(item).strip()]
+        return _paperclip_request("POST", f"/companies/{company_id}/issues", body, payload.get("agentId"), run_id)
+
+    if tool == "paperclip_create_routine":
+        title = _clean_text(args.get("title"), max_len=200)
+        description = _clean_text(args.get("description"), max_len=8000)
+        project_id = _clean_text(args.get("project_id") or args.get("projectId"), max_len=128)
+        if not title:
+            raise RuntimeError("paperclip_create_routine requires title")
+        if not project_id:
+            raise RuntimeError("paperclip_create_routine requires project_id")
+
+        self_agent_id = payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID")
+        assignee = _normalized_agent_id(
+            args.get("assignee_agent_id") or args.get("assigneeAgentId") or "self",
+            payload,
+        )
+        if assignee != self_agent_id:
+            raise RuntimeError(
+                "paperclip_create_routine only supports self-assigned routines with agent credentials"
+            )
+
+        priority = _clean_text(args.get("priority") or "medium", max_len=40).lower()
+        if priority not in {"critical", "high", "medium", "low"}:
+            priority = "medium"
+        status = _clean_text(args.get("status") or "active", max_len=40).lower()
+        if status not in {"active", "paused"}:
+            status = "active"
+        concurrency_policy = _clean_text(
+            args.get("concurrency_policy") or args.get("concurrencyPolicy") or "coalesce_if_active",
+            max_len=80,
+        )
+        if concurrency_policy not in {"coalesce_if_active", "always_enqueue", "skip_if_active"}:
+            concurrency_policy = "coalesce_if_active"
+        catch_up_policy = _clean_text(
+            args.get("catch_up_policy") or args.get("catchUpPolicy") or "skip_missed",
+            max_len=80,
+        )
+        if catch_up_policy not in {"skip_missed", "enqueue_missed_with_cap"}:
+            catch_up_policy = "skip_missed"
+
+        body = {
+            "projectId": project_id,
+            "title": title,
+            "description": description or None,
+            "assigneeAgentId": assignee,
+            "priority": priority,
+            "status": status,
+            "concurrencyPolicy": concurrency_policy,
+            "catchUpPolicy": catch_up_policy,
+        }
+        for source_key, target_key in (
+            ("goal_id", "goalId"),
+            ("goalId", "goalId"),
+            ("parent_issue_id", "parentIssueId"),
+            ("parentIssueId", "parentIssueId"),
+        ):
+            value = _clean_text(args.get(source_key), max_len=128)
+            if value:
+                body[target_key] = value
+
+        routine = _paperclip_request(
+            "POST",
+            f"/companies/{company_id}/routines",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+        schedule = args.get("schedule") if isinstance(args.get("schedule"), dict) else {}
+        cron_expression = _clean_text(
+            args.get("cron_expression")
+            or args.get("cronExpression")
+            or schedule.get("cron_expression")
+            or schedule.get("cronExpression"),
+            max_len=120,
+        )
+        if not cron_expression:
+            return routine
+
+        trigger_body = {
+            "kind": "schedule",
+            "cronExpression": cron_expression,
+            "timezone": _clean_text(
+                args.get("timezone") or schedule.get("timezone") or "UTC",
+                max_len=120,
+            )
+            or "UTC",
+            "enabled": bool(schedule.get("enabled", args.get("enabled", True))),
+        }
+        label = _clean_text(args.get("label") or schedule.get("label"), max_len=120)
+        if label:
+            trigger_body["label"] = label
+
+        trigger = _paperclip_request(
+            "POST",
+            f"/routines/{urllib.parse.quote(str(routine.get('id')))}/triggers",
+            trigger_body,
+            payload.get("agentId"),
+            run_id,
+        )
+        return {"routine": routine, "trigger": trigger}
+
+    if tool == "paperclip_list_routines":
+        query = _encoded_query(
+            {
+                "assigneeAgentId": _normalized_agent_id(
+                    _first_arg(args, "assignee_agent_id", "assigneeAgentId", "agent_id", "agentId"),
+                    payload,
+                ),
+                "projectId": _first_arg(args, "project_id", "projectId"),
+                "goalId": _first_arg(args, "goal_id", "goalId"),
+                "status": _first_arg(args, "status"),
+                "limit": _bounded_limit(args.get("limit"), default=50, maximum=100),
+            }
+        )
+        suffix = f"?{query}" if query else ""
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/routines{suffix}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_routine":
+        routine_id = _routine_id_arg(args, tool)
+        return _paperclip_request(
+            "GET",
+            f"/routines/{urllib.parse.quote(routine_id)}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_update_routine":
+        routine_id = _routine_id_arg(args, tool)
+        self_agent_id = _current_agent_id(payload)
+        assignee = _normalized_agent_id(_first_arg(args, "assignee_agent_id", "assigneeAgentId"), payload)
+        if assignee and assignee != self_agent_id:
+            raise RuntimeError("paperclip_update_routine only supports self-assigned routines with agent credentials")
+        body = _copy_clean_fields(
+            args,
+            (
+                (("title",), "title"),
+                (("description", "body", "summary"), "description"),
+                (("priority",), "priority"),
+                (("status",), "status"),
+                (("project_id", "projectId"), "projectId"),
+                (("goal_id", "goalId"), "goalId"),
+                (("parent_issue_id", "parentIssueId", "parent_id", "parentId"), "parentIssueId"),
+                (("concurrency_policy", "concurrencyPolicy"), "concurrencyPolicy"),
+                (("catch_up_policy", "catchUpPolicy"), "catchUpPolicy"),
+                (("variables",), "variables"),
+            ),
+        )
+        if assignee:
+            body["assigneeAgentId"] = assignee
+        if not body:
+            raise RuntimeError("paperclip_update_routine requires at least one update field")
+        return _paperclip_request(
+            "PATCH",
+            f"/routines/{urllib.parse.quote(routine_id)}",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_create_routine_trigger":
+        routine_id = _routine_id_arg(args, tool)
+        schedule = args.get("schedule") if isinstance(args.get("schedule"), dict) else {}
+        kind = _clean_text(_first_arg(args, "kind", "trigger_kind", "triggerKind", default="schedule"), max_len=40).lower()
+        if kind not in {"schedule", "webhook", "api"}:
+            raise RuntimeError("paperclip_create_routine_trigger kind must be schedule, webhook, or api")
+        body = {
+            "kind": kind,
+            "enabled": _clean_bool(_first_arg(args, "enabled", default=schedule.get("enabled")), default=True),
+        }
+        label = _clean_text(_first_arg(args, "label", default=schedule.get("label")), max_len=120)
+        if label:
+            body["label"] = label
+        if kind == "schedule":
+            cron_expression = _clean_text(
+                _first_arg(args, "cron_expression", "cronExpression", default=schedule.get("cronExpression") or schedule.get("cron_expression")),
+                max_len=120,
+            )
+            if not cron_expression:
+                raise RuntimeError("paperclip_create_routine_trigger schedule requires cron_expression")
+            body["cronExpression"] = cron_expression
+            body["timezone"] = _clean_text(
+                _first_arg(args, "timezone", default=schedule.get("timezone") or "UTC"),
+                max_len=120,
+            ) or "UTC"
+        if kind == "webhook":
+            signing_mode = _clean_text(
+                _first_arg(args, "signing_mode", "signingMode", default="hmac_sha256"),
+                max_len=80,
+            )
+            if signing_mode in {"bearer", "hmac_sha256", "github_hmac", "none"}:
+                body["signingMode"] = signing_mode
+        return _paperclip_request(
+            "POST",
+            f"/routines/{urllib.parse.quote(routine_id)}/triggers",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_update_routine_trigger":
+        trigger_id = _trigger_id_arg(args, tool)
+        body = _copy_clean_fields(
+            args,
+            (
+                (("label",), "label"),
+                (("cron_expression", "cronExpression"), "cronExpression"),
+                (("timezone",), "timezone"),
+                (("signing_mode", "signingMode"), "signingMode"),
+            ),
+        )
+        if _first_arg(args, "enabled") is not None:
+            body["enabled"] = _clean_bool(args.get("enabled"), default=True)
+        if not body:
+            raise RuntimeError("paperclip_update_routine_trigger requires at least one update field")
+        return _paperclip_request(
+            "PATCH",
+            f"/routine-triggers/{urllib.parse.quote(trigger_id)}",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_delete_routine_trigger":
+        trigger_id = _trigger_id_arg(args, tool)
+        return _paperclip_request(
+            "DELETE",
+            f"/routine-triggers/{urllib.parse.quote(trigger_id)}",
+            None,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_run_routine":
+        routine_id = _routine_id_arg(args, tool)
+        self_agent_id = _current_agent_id(payload)
+        assignee = _normalized_agent_id(_first_arg(args, "assignee_agent_id", "assigneeAgentId"), payload)
+        if assignee and assignee != self_agent_id:
+            raise RuntimeError("paperclip_run_routine only supports self-assigned runs with agent credentials")
+        body = _copy_clean_fields(
+            args,
+            (
+                (("source",), "source"),
+                (("trigger_id", "triggerId"), "triggerId"),
+                (("payload",), "payload"),
+                (("variables",), "variables"),
+                (("project_id", "projectId"), "projectId"),
+                (("idempotency_key", "idempotencyKey"), "idempotencyKey"),
+            ),
+        )
+        if assignee:
+            body["assigneeAgentId"] = assignee
+        if "source" not in body:
+            body["source"] = "agent"
+        return _paperclip_request(
+            "POST",
+            f"/routines/{urllib.parse.quote(routine_id)}/run",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool in {"paperclip_comment_on_task", "paperclip_report_to_manager"}:
+        issue_id = _clean_text(
+            args.get("issue_id") or args.get("issueId") or args.get("task_id") or args.get("taskId") or _payload_task_id(payload),
+            max_len=128,
+        )
+        body_text = _clean_text(
+            args.get("body")
+            or args.get("content")
+            or args.get("text")
+            or args.get("comment")
+            or args.get("summary")
+            or args.get("message"),
+            max_len=8000,
+        )
+        if not issue_id:
+            raise RuntimeError(f"{tool} requires issue_id")
+        if not body_text:
+            raise RuntimeError(f"{tool} requires body")
+        return _paperclip_request(
+            "POST",
+            f"/issues/{urllib.parse.quote(issue_id)}/comments",
+            {"body": body_text},
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_get_task":
+        issue_id = _clean_text(
+            args.get("issue_id") or args.get("issueId") or args.get("task_id") or args.get("taskId"),
+            max_len=128,
+        )
+        if not issue_id:
+            raise RuntimeError("paperclip_get_task requires issue_id")
+        return _paperclip_request("GET", f"/issues/{urllib.parse.quote(issue_id)}", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_get_task_comments":
+        issue_id = _clean_text(
+            args.get("issue_id") or args.get("issueId") or args.get("task_id") or args.get("taskId"),
+            max_len=128,
+        )
+        if not issue_id:
+            raise RuntimeError("paperclip_get_task_comments requires issue_id")
+        return _paperclip_request("GET", f"/issues/{urllib.parse.quote(issue_id)}/comments", agent_id=payload.get("agentId"))
+
+    if tool in {"paperclip_get_my_tasks", "paperclip_get_created_tasks"}:
+        agent_id = _normalized_agent_id(
+            args.get("agent_id") or args.get("agentId") or "self",
+            payload,
+        )
+        status = _clean_text(args.get("status"), max_len=120)
+        query = {"participantAgentId" if tool == "paperclip_get_created_tasks" else "assigneeAgentId": agent_id}
+        if status:
+            query["status"] = status
+        encoded = urllib.parse.urlencode({key: value for key, value in query.items() if value})
+        return _paperclip_request("GET", f"/companies/{company_id}/issues?{encoded}", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_list_goals":
+        query = _encoded_query({"status": args.get("status"), "limit": _bounded_limit(args.get("limit"), default=50, maximum=100)})
+        suffix = f"?{query}" if query else ""
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/goals{suffix}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_goal":
+        goal_id = _clean_text(_first_arg(args, "goal_id", "goalId", "id"), max_len=128)
+        if not goal_id:
+            raise RuntimeError("paperclip_get_goal requires goal_id")
+        return _paperclip_request("GET", f"/goals/{urllib.parse.quote(goal_id)}", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_create_goal":
+        body = _copy_clean_fields(
+            args,
+            (
+                (("title", "name"), "title"),
+                (("description", "body", "summary"), "description"),
+                (("status",), "status"),
+                (("priority",), "priority"),
+                (("target_date", "targetDate"), "targetDate"),
+            ),
+        )
+        if "title" not in body:
+            raise RuntimeError("paperclip_create_goal requires title")
+        return _paperclip_request(
+            "POST",
+            f"/companies/{urllib.parse.quote(company_id)}/goals",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_update_goal":
+        goal_id = _clean_text(_first_arg(args, "goal_id", "goalId", "id"), max_len=128)
+        if not goal_id:
+            raise RuntimeError("paperclip_update_goal requires goal_id")
+        body = _copy_clean_fields(
+            args,
+            (
+                (("title", "name"), "title"),
+                (("description", "body", "summary"), "description"),
+                (("status",), "status"),
+                (("priority",), "priority"),
+                (("target_date", "targetDate"), "targetDate"),
+            ),
+        )
+        if not body:
+            raise RuntimeError("paperclip_update_goal requires at least one update field")
+        return _paperclip_request(
+            "PATCH",
+            f"/goals/{urllib.parse.quote(goal_id)}",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_list_projects":
+        query = _encoded_query({"status": args.get("status"), "limit": _bounded_limit(args.get("limit"), default=50, maximum=100)})
+        suffix = f"?{query}" if query else ""
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/projects{suffix}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_project":
+        project_id = _clean_text(_first_arg(args, "project_id", "projectId", "id"), max_len=128)
+        if not project_id:
+            raise RuntimeError("paperclip_get_project requires project_id")
+        return _paperclip_request("GET", f"/projects/{urllib.parse.quote(project_id)}", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_create_project":
+        body = _copy_clean_fields(
+            args,
+            (
+                (("name", "title"), "name"),
+                (("description", "body", "summary"), "description"),
+                (("status",), "status"),
+                (("goal_id", "goalId"), "goalId"),
+                (("goal_ids", "goalIds"), "goalIds"),
+            ),
+        )
+        if "name" not in body:
+            raise RuntimeError("paperclip_create_project requires name")
+        return _paperclip_request(
+            "POST",
+            f"/companies/{urllib.parse.quote(company_id)}/projects",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_update_project":
+        project_id = _clean_text(_first_arg(args, "project_id", "projectId", "id"), max_len=128)
+        if not project_id:
+            raise RuntimeError("paperclip_update_project requires project_id")
+        body = _copy_clean_fields(
+            args,
+            (
+                (("name", "title"), "name"),
+                (("description", "body", "summary"), "description"),
+                (("status",), "status"),
+                (("goal_id", "goalId"), "goalId"),
+                (("goal_ids", "goalIds"), "goalIds"),
+            ),
+        )
+        if not body:
+            raise RuntimeError("paperclip_update_project requires at least one update field")
+        return _paperclip_request(
+            "PATCH",
+            f"/projects/{urllib.parse.quote(project_id)}",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_list_approvals":
+        query = _encoded_query(
+            {
+                "status": args.get("status"),
+                "type": args.get("type"),
+                "requestedByAgentId": _normalized_agent_id(
+                    _first_arg(args, "requested_by_agent_id", "requestedByAgentId"),
+                    payload,
+                ),
+                "limit": _bounded_limit(args.get("limit"), default=50, maximum=100),
+            }
+        )
+        suffix = f"?{query}" if query else ""
+        return _paperclip_request(
+            "GET",
+            f"/companies/{urllib.parse.quote(company_id)}/approvals{suffix}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_get_approval":
+        approval_id = _clean_text(_first_arg(args, "approval_id", "approvalId", "id"), max_len=128)
+        if not approval_id:
+            raise RuntimeError("paperclip_get_approval requires approval_id")
+        return _paperclip_request("GET", f"/approvals/{urllib.parse.quote(approval_id)}", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_request_approval":
+        approval_type = _clean_text(_first_arg(args, "type", "approval_type", "approvalType", default="request_board_approval"), max_len=80)
+        title = _clean_text(_first_arg(args, "title", "name"), max_len=240)
+        if not title:
+            raise RuntimeError("paperclip_request_approval requires title")
+        approval_payload = _copy_clean_fields(
+            args,
+            (
+                (("title", "name"), "title"),
+                (("summary", "description", "body"), "summary"),
+                (("recommended_action", "recommendedAction"), "recommendedAction"),
+                (("risks",), "risks"),
+                (("plan",), "plan"),
+            ),
+        )
+        body = {
+            "type": approval_type,
+            "requestedByAgentId": _current_agent_id(payload),
+            "payload": approval_payload,
+        }
+        return _paperclip_request(
+            "POST",
+            f"/companies/{urllib.parse.quote(company_id)}/approvals",
+            body,
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_get_approval_issues":
+        approval_id = _clean_text(_first_arg(args, "approval_id", "approvalId", "id"), max_len=128)
+        if not approval_id:
+            raise RuntimeError("paperclip_get_approval_issues requires approval_id")
+        return _paperclip_request("GET", f"/approvals/{urllib.parse.quote(approval_id)}/issues", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_get_approval_comments":
+        approval_id = _clean_text(_first_arg(args, "approval_id", "approvalId", "id"), max_len=128)
+        if not approval_id:
+            raise RuntimeError("paperclip_get_approval_comments requires approval_id")
+        return _paperclip_request("GET", f"/approvals/{urllib.parse.quote(approval_id)}/comments", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_comment_on_approval":
+        approval_id = _clean_text(_first_arg(args, "approval_id", "approvalId", "id"), max_len=128)
+        body_text = _clean_text(_first_arg(args, "body", "comment", "summary", "message"), max_len=8000)
+        if not approval_id:
+            raise RuntimeError("paperclip_comment_on_approval requires approval_id")
+        if not body_text:
+            raise RuntimeError("paperclip_comment_on_approval requires body")
+        return _paperclip_request(
+            "POST",
+            f"/approvals/{urllib.parse.quote(approval_id)}/comments",
+            {"body": body_text},
+            payload.get("agentId"),
+            run_id,
+        )
+
+    if tool == "paperclip_list_task_documents":
+        issue_id = _issue_id_arg(args, payload, tool)
+        return _paperclip_request("GET", f"/issues/{urllib.parse.quote(issue_id)}/documents", agent_id=payload.get("agentId"))
+
+    if tool == "paperclip_get_task_document":
+        issue_id = _issue_id_arg(args, payload, tool)
+        key = _clean_text(_first_arg(args, "key", "document_key", "documentKey"), max_len=240)
+        if not key:
+            raise RuntimeError("paperclip_get_task_document requires key")
+        return _paperclip_request(
+            "GET",
+            f"/issues/{urllib.parse.quote(issue_id)}/documents/{urllib.parse.quote(key)}",
+            agent_id=payload.get("agentId"),
+        )
+
+    if tool == "paperclip_put_task_document":
+        issue_id = _issue_id_arg(args, payload, tool)
+        key = _clean_text(_first_arg(args, "key", "document_key", "documentKey"), max_len=240)
+        declared_key = _payload_report_document_key(payload)
+        if declared_key:
+            key = declared_key
+        body_text = _clean_text(_first_arg(args, "body", "content", "markdown", "html"), max_len=20000)
+        format_text = _clean_text(
+            _first_arg(args, "format", "document_format", "documentFormat") or "markdown",
+            max_len=32,
+        ).lower()
+        if not key:
+            raise RuntimeError("paperclip_put_task_document requires key")
+        if not body_text:
+            raise RuntimeError("paperclip_put_task_document requires body")
+        if format_text not in {"markdown", "html", "json"}:
+            raise RuntimeError("paperclip_put_task_document format must be markdown, html, or json")
+        if key == REPORT_CONTRACT_V1_KEY:
+            _validate_report_contract_v1_body(body_text)
+            # Paperclip documents currently support markdown/html formats only.
+            # Store the raw JSON text as markdown so consumers can parse the body.
+            format_text = "markdown"
+        if format_text == "html":
+            body_text = _style_report_document(body_text)
+        request_body = {"body": body_text, "format": format_text}
+        base_revision_id = _clean_text(
+            _first_arg(args, "baseRevisionId", "base_revision_id", "baseRevision"),
+            max_len=80,
+        )
+        if base_revision_id:
+            request_body["baseRevisionId"] = base_revision_id
+        path = f"/issues/{urllib.parse.quote(issue_id)}/documents/{urllib.parse.quote(key)}"
+        try:
+            return _paperclip_request(
+                "PUT",
+                path,
+                request_body,
+                payload.get("agentId"),
+                run_id,
+            )
+        except PaperclipRequestError as error:
+            message = error.detail
+            if base_revision_id or "requires baseRevisionId" not in message:
+                raise
+            match = re.search(r'"currentRevisionId"\s*:\s*"([^"]+)"', message)
+            if not match:
+                raise
+            request_body["baseRevisionId"] = match.group(1)
+            return _paperclip_request(
+                "PUT",
+                path,
+                request_body,
+                payload.get("agentId"),
+                run_id,
+            )
+
+    raise RuntimeError(f"Unsupported Paperclip tool: {tool}")
+
+
+def _json_object_prefix(raw):
+    text = _ANSI_RE.sub("", str(raw or "")).strip()
+    if not text:
+        raise json.JSONDecodeError("empty tool call", text, 0)
+
+    candidates = (text.replace('\\"', '"'), text) if '\\"' in text else (text,)
+    for candidate in candidates:
+        start = candidate.find("{")
+        if start < 0:
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(candidate[start:], start=start):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return candidate[start : index + 1]
+    return text
+
+
+def _extract_tool_calls(stdout):
+    calls = []
+    for line in (stdout or "").splitlines():
+        stripped_line = line.lstrip()
+        if stripped_line.startswith(f"+{TOOL_CALL_PREFIX}") or stripped_line.startswith(f"-{TOOL_CALL_PREFIX}"):
+            continue
+        if TOOL_CALL_PREFIX not in line:
+            continue
+        raw = line.split(TOOL_CALL_PREFIX, 1)[1].strip()
+        if "{" not in raw:
+            continue
+        try:
+            calls.append(json.loads(_json_object_prefix(raw)))
+        except json.JSONDecodeError as error:
+            calls.append({"_parse_error": str(error), "_raw": raw[:500]})
+    return calls
+
+
+def _execute_paperclip_tools(stdout, payload):
+    return _execute_paperclip_tool_calls(_extract_tool_calls(stdout), payload)
+
+
+def _tool_result_name(result):
+    if not isinstance(result, dict):
+        return ""
+    return str(result.get("tool") or result.get("name") or result.get("action") or "").strip()
+
+
+def _has_report_document_write(results):
+    return any(
+        isinstance(result, dict)
+        and result.get("ok") is True
+        and _tool_result_name(result) == "paperclip_put_task_document"
+        for result in results or []
+    )
+
+
+def _has_report_contract_document_write(results):
+    return any(
+        isinstance(result, dict)
+        and result.get("ok") is True
+        and _tool_result_name(result) == "paperclip_put_task_document"
+        and result.get("documentKey") == REPORT_CONTRACT_V1_KEY
+        for result in results or []
+    )
+
+
+def _has_task_status_update(results):
+    return any(
+        isinstance(result, dict)
+        and result.get("ok") is True
+        and _tool_result_name(result) == "paperclip_update_task"
+        for result in results or []
+    )
+
+
+def _prompt_requires_report_document(prompt):
+    lowered = (prompt or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "paperclip document delivery is mandatory",
+            "document delivery is mandatory",
+            "report document",
+            "report output contract",
+            "generated report is the only html surface",
+            "html output",
+            "output format: html",
+            "paperclip document key:",
+            "format=&quot;html&quot;",
+            'format="html"',
+            "format=html",
+            REPORT_CONTRACT_V1_KEY,
+        )
+    )
+
+
+def _prompt_requires_report_contract(prompt):
+    lowered = (prompt or "").lower()
+    return REPORT_CONTRACT_V1_KEY in lowered or "report contract v1" in lowered
+
+
+def _extract_html_report_body(raw_text):
+    text = _ANSI_RE.sub("", str(raw_text or "")).replace("#012", "\n")
+    reconstructed_lines = []
+    in_hunk = False
+    capture_diff = False
+    for line in text.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk or line.startswith("+++") or line.startswith("---"):
+            continue
+        content = None
+        if line.startswith(" "):
+            content = line[1:]
+        elif line.startswith("+"):
+            content = line[1:]
+        elif line.startswith("-"):
+            continue
+        if content is None:
+            continue
+        if content.lstrip().startswith("<section"):
+            capture_diff = True
+        if capture_diff:
+            reconstructed_lines.append(content)
+    if reconstructed_lines:
+        body = _first_complete_section("\n".join(reconstructed_lines))
+        if body:
+            return body[:20000]
+
+    body = _first_complete_section(text)
+    if body:
+        return body[:20000]
+    return ""
+
+
+def _style_report_document(body):
+    raw = str(body or "").strip()
+    if not raw:
+        return ""
+    if "data-paperclip-report-style" in raw or "data-paperclip-report-shell" in raw:
+        return raw[:20000]
+
+    document_head = """<meta charset="utf-8">
+<style data-paperclip-report-style>
+:root {
+  color-scheme: light;
+  --pc-report-bg: #eef2ee;
+  --pc-report-page: #fffef9;
+  --pc-report-ink: #17211d;
+  --pc-report-muted: #65736c;
+  --pc-report-line: #d8e0d8;
+  --pc-report-accent: #153b33;
+  --pc-report-gold: #b48224;
+  --pc-report-soft: #f6f8f4;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--pc-report-bg);
+  color: var(--pc-report-ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+}
+* {
+  box-sizing: border-box;
+}
+.pc-report {
+  width: min(960px, calc(100% - 32px));
+  margin: 24px auto;
+  padding: 34px 38px 40px;
+  background: var(--pc-report-page);
+  border: 1px solid var(--pc-report-line);
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(23, 33, 29, 0.10);
+}
+.pc-report > section {
+  margin: 0;
+}
+.pc-report h1,
+.pc-report h2,
+.pc-report h3 {
+  margin: 0;
+  color: var(--pc-report-ink);
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-weight: 700;
+  line-height: 1.14;
+  letter-spacing: 0;
+}
+.pc-report h1,
+.pc-report h2:first-child {
+  padding-bottom: 16px;
+  border-bottom: 2px solid var(--pc-report-accent);
+  font-size: 31px;
+}
+.pc-report h2 {
+  margin-top: 26px;
+  font-size: 23px;
+}
+.pc-report h3 {
+  margin-top: 22px;
+  font-size: 17px;
+}
+.pc-report p {
+  margin: 14px 0 0;
+}
+.pc-report .timestamp,
+.pc-report [class*="timestamp"],
+.pc-report [class*="generated"] {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  margin-top: 18px;
+  padding: 5px 9px;
+  border: 1px solid var(--pc-report-line);
+  border-radius: 6px;
+  background: var(--pc-report-soft);
+  color: var(--pc-report-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.pc-report table {
+  width: 100%;
+  margin: 18px 0 0;
+  border: 1px solid var(--pc-report-line);
+  border-spacing: 0;
+  border-collapse: separate;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.pc-report th,
+.pc-report td {
+  padding: 11px 13px;
+  text-align: left;
+  vertical-align: top;
+  border-top: 1px solid var(--pc-report-line);
+}
+.pc-report tr:first-child th,
+.pc-report tr:first-child td {
+  border-top: 0;
+}
+.pc-report th {
+  background: var(--pc-report-accent);
+  color: #fbfdf9;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.pc-report td {
+  background: #ffffff;
+}
+.pc-report tr:nth-child(even) td {
+  background: var(--pc-report-soft);
+}
+.pc-report ul,
+.pc-report ol {
+  margin: 14px 0 0;
+  padding-left: 22px;
+}
+.pc-report li + li {
+  margin-top: 6px;
+}
+.pc-report pre,
+.pc-report code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.pc-report pre {
+  max-width: 100%;
+  margin: 14px 0 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 8px;
+  background: #101713;
+  color: #edf4ef;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.pc-report .no-trade,
+.pc-report .notice,
+.pc-report .summary,
+.pc-report .data-sources,
+.pc-report .sources {
+  margin-top: 18px;
+  padding: 13px 15px;
+  border: 1px solid var(--pc-report-line);
+  border-left: 4px solid var(--pc-report-gold);
+  border-radius: 8px;
+  background: #fffaf0;
+}
+.pc-report .alpha-tracker table:first-of-type,
+.pc-report .status-summary {
+  margin-top: 22px;
+}
+.pc-report a {
+  color: #0b6255;
+  font-weight: 650;
+}
+@media (max-width: 720px) {
+  .pc-report {
+    width: calc(100% - 20px);
+    margin: 10px auto;
+    padding: 24px 18px 28px;
+  }
+  .pc-report h1,
+  .pc-report h2:first-child {
+    font-size: 24px;
+  }
+  .pc-report table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+</style>"""
+
+    if re.search(r"<html\b", raw[:512], re.IGNORECASE):
+        if re.search(r"</head>", raw, re.IGNORECASE):
+            return re.sub(r"</head>", document_head + "\n</head>", raw, count=1, flags=re.IGNORECASE)[:20000]
+        return (document_head + "\n" + raw)[:20000]
+
+    return (
+        document_head
+        + '\n<article class="pc-report" data-paperclip-report-shell="true">\n'
+        + raw
+        + "\n</article>"
+    )[:20000]
+
+
+def _first_complete_section(text):
+    start = str(text or "").find("<section")
+    if start < 0:
+        return ""
+    lines = []
+    depth = 0
+    for line in str(text or "")[start:].splitlines():
+        lines.append(line)
+        depth += len(re.findall(r"<section\b", line))
+        depth -= line.count("</section>")
+        if depth <= 0 and "</section>" in line:
+            body = "\n".join(lines).strip()
+            return body if body.startswith("<section") else ""
+    return ""
+
+
+def _read_latest_prompt_html_report(prompt):
+    directories = set()
+    if "Alpha Engine Daily Tracker" in str(prompt or ""):
+        directories.add("/home/agent/.hermes/data/alpha_engine/")
+    for match in re.findall(r"(/home/agent/\.hermes/[A-Za-z0-9_./-]+/)", str(prompt or "")):
+        directory = os.path.normpath(match) + os.sep
+        if directory.startswith("/home/agent/.hermes/"):
+            directories.add(directory)
+
+    candidates = []
+    for directory in directories:
+        try:
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if name.endswith(".html") and os.path.isfile(path):
+                    candidates.append(path)
+        except OSError:
+            continue
+
+    for path in sorted(candidates, key=lambda item: os.path.getmtime(item), reverse=True):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                body = handle.read().strip()
+        except OSError:
+            continue
+        body = _first_complete_section(body)
+        if body:
+            return body[:20000]
+    return ""
+
+
+def _cic_prompt_html_report(prompt):
+    if "CIC Morning Report" not in str(prompt or ""):
+        return ""
+    script_path = "/home/agent/scripts/cic_morning_report.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    return _cic_text_to_html(completed.stdout)
+
+
+def _sctr_prompt_html_report(prompt):
+    prompt_text = str(prompt or "")
+    if not any(marker in prompt_text for marker in ("SCTR Morning Brief", "SCTR Intraday", "SCTR Evening Baseline")):
+        return ""
+    if "SCTR Intraday" in prompt_text:
+        report_title = "SCTR Intraday"
+    elif "SCTR Evening Baseline" in prompt_text:
+        report_title = "SCTR Evening Baseline"
+    else:
+        report_title = "SCTR Morning Brief"
+    script_path = "/home/agent/scripts/stockcharts_scanner.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path, "--drill", "2", "--stocks", "3", "--title", report_title],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _first_complete_section(completed.stdout)
+    return (body or completed.stdout.strip())[:20000]
+
+
+def _data_pipeline_prompt_html_report(prompt):
+    if "Data Pipeline Health" not in str(prompt or ""):
+        return ""
+    script_path = "/home/agent/scripts/data_pipeline_health.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _first_complete_section(completed.stdout)
+    return (body or completed.stdout.strip())[:20000]
+
+
+def _alpha_engine_prompt_html_report(prompt):
+    prompt_text = str(prompt or "")
+    if "Alpha Engine Daily Tracker" not in prompt_text and "Alpha Engine Weekly Report" not in prompt_text:
+        return ""
+    mode = "weekly" if "Alpha Engine Weekly Report" in prompt_text else "daily"
+    script_path = "/home/agent/scripts/alpha_engine_tracker.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path, mode],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _first_complete_section(completed.stdout)
+    return (body or completed.stdout.strip())[:20000]
+
+
+def _unified_eod_prompt_html_report(prompt):
+    if "Unified EOD Report" not in str(prompt or ""):
+        return ""
+    script_path = "/home/agent/scripts/unified_eod_report.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _first_complete_section(completed.stdout)
+    return (body or completed.stdout.strip())[:20000]
+
+
+def _routine_monitor_prompt_html_report(prompt):
+    if "Routine Run Monitor" not in str(prompt or ""):
+        return ""
+    script_path = "/home/agent/scripts/finance_trading_ops_monitor.py"
+    python_path = "/home/agent/hermes-agent/venv/bin/python"
+    if not os.path.isfile(script_path) or not os.path.isfile(python_path):
+        return ""
+    try:
+        completed = subprocess.run(
+            [python_path, script_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _first_complete_section(completed.stdout)
+    return (body or completed.stdout.strip())[:20000]
+
+
+def _cic_text_to_html(report_text):
+    text = str(report_text or "").replace("#012", "\n").strip()
+    if not text:
+        return ""
+    generated = ""
+    title = "CIC Morning Report"
+    rows = []
+    alignments = []
+    current_basket = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading = re.fullmatch(r"\*\*(.+?)\*\*(?:\s+[—-]\s+(.+))?", line)
+        if heading:
+            heading_text = heading.group(1).strip()
+            if heading_text == "CIC":
+                generated = (heading.group(2) or "").strip()
+            elif heading_text == "Alignment":
+                current_basket = "Alignment"
+            else:
+                current_basket = heading_text
+            continue
+        if current_basket == "Alignment":
+            clean_line = re.sub(r"^[^\w]+", "", line).strip()
+            if clean_line:
+                alignments.append(clean_line)
+            continue
+        match = re.match(
+            r"^[^\w]*(Daily|Weekly|Monthly|Quarterly)\s+"
+            r"(BULL|BEAR)\s+\(([^)]+)\)\s+[—-]\s+"
+            r"(.+?)\s+held\s+(.+?)\s+\|\s+(.+?)\s+took\s+(.+?)\s+→\s+(.+)$",
+            line,
+        )
+        if match and current_basket:
+            timeframe, direction, split, held, held_level, took, took_level, state = match.groups()
+            rows.append(
+                {
+                    "basket": current_basket,
+                    "timeframe": timeframe,
+                    "direction": direction,
+                    "split": split,
+                    "held": held,
+                    "heldLevel": held_level,
+                    "took": took,
+                    "tookLevel": took_level,
+                    "state": state,
+                }
+            )
+
+    date_label = datetime.now(UTC).strftime("%Y-%m-%d")
+    generated_label = _html_escape(generated or datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"))
+    summary = "No CICs detected across the configured baskets."
+    if rows:
+        aligned_count = len(alignments)
+        top = alignments[0] if alignments else f"{rows[0]['basket']} {rows[0]['direction']} {rows[0]['timeframe']}"
+        summary = (
+            f"{len(rows)} CIC signals detected across {len(set(row['basket'] for row in rows))} baskets. "
+            f"{aligned_count} daily/weekly alignments flagged. Primary focus: {_html_escape(top)}."
+        )
+
+    row_html = []
+    for row in rows:
+        row_html.append(
+            "<tr>"
+            f"<td>{_html_escape(row['basket'])}</td>"
+            f"<td>{_html_escape(row['timeframe'])}</td>"
+            f"<td>{_html_escape(row['direction'])}</td>"
+            f"<td>{_html_escape(row['split'])}</td>"
+            f"<td>{_html_escape(row['held'])} held {_html_escape(row['heldLevel'])}</td>"
+            f"<td>{_html_escape(row['took'])} took {_html_escape(row['tookLevel'])}</td>"
+            f"<td>{_html_escape(row['state'])}</td>"
+            "</tr>"
+        )
+    if not row_html:
+        row_html.append('<tr><td colspan="7">No CICs detected across configured baskets.</td></tr>')
+
+    alignment_items = "".join(f"<li>{_html_escape(item)}</li>" for item in alignments) or "<li>No daily/weekly alignments flagged.</li>"
+    routine_contracts_sha = _sha256_file(ROUTINE_CONTRACTS_PATH)
+    return (
+        f'<section class="cic-morning-report" data-date="{_html_escape(date_label)}">'
+        f"<h2>{_html_escape(title)} — {_html_escape(date_label)}</h2>"
+        f'<p class="timestamp">Generated: {generated_label}</p>'
+        '<div class="summary">'
+        "<strong>Executive Summary</strong>"
+        f"<p>{summary}</p>"
+        "</div>"
+        "<h3>Signal Table</h3>"
+        "<table>"
+        "<tr><th>Basket</th><th>Timeframe</th><th>Direction</th><th>Split</th><th>Held</th><th>Took</th><th>State</th></tr>"
+        + "".join(row_html)
+        + "</table>"
+        '<div class="notice">'
+        "<strong>Aligned Signals</strong>"
+        f"<ul>{alignment_items}</ul>"
+        "</div>"
+        '<section class="data-sources">'
+        "<h3>Data Sources</h3>"
+        "<ul>"
+        "<li>Script: /home/agent/scripts/cic_morning_report.py</li>"
+        "<li>Runtime: /home/agent/hermes-agent/venv/bin/python</li>"
+        "<li>Baskets: Equity ES/NQ/YM/RTY; Metals GC/SI/PL; Energy CL/HO/RB; FX 6E/6B.</li>"
+        "<li>Provider: yfinance futures data at report runtime.</li>"
+        "</ul>"
+        "</section>"
+        '<section class="provenance">'
+        "<h3>Provenance</h3>"
+        "<ul>"
+        f"<li>Routine contracts: {_html_escape(ROUTINE_CONTRACTS_PATH)}</li>"
+        f"<li>Routine contracts SHA256: <code>{_html_escape(routine_contracts_sha)}</code></li>"
+        f"<li>Source-of-truth mirror: {_html_escape(SOURCE_OF_TRUTH_PATH)}</li>"
+        f"<li>Source-of-truth present: {_html_escape(str(os.path.isdir(SOURCE_OF_TRUTH_PATH)))}</li>"
+        "</ul>"
+        "</section>"
+        "</section>"
+    )[:20000]
+
+
+def _sha256_file(path):
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _slug_text(value, fallback="scheduled-report"):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug[:80] or fallback
+
+
+def _validate_report_contract_v1_body(body_text):
+    try:
+        payload = json.loads(str(body_text or ""))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"report-contract-v1 body must be valid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("report-contract-v1 body must be a JSON object")
+    required = (
+        "contract_version",
+        "report_id",
+        "stream_id",
+        "kind",
+        "workspace",
+        "generated_at",
+        "period",
+        "title",
+        "agent",
+        "blocks",
+    )
+    missing = [key for key in required if payload.get(key) in (None, "", [], {})]
+    if missing:
+        raise RuntimeError(f"report-contract-v1 missing required fields: {', '.join(missing)}")
+    if str(payload.get("contract_version")) != "1":
+        raise RuntimeError("report-contract-v1 contract_version must be 1")
+    if not isinstance(payload.get("period"), dict):
+        raise RuntimeError("report-contract-v1 period must be an object")
+    if not isinstance(payload.get("agent"), dict) or not payload["agent"].get("id"):
+        raise RuntimeError("report-contract-v1 agent.id is required")
+    if not isinstance(payload.get("blocks"), list):
+        raise RuntimeError("report-contract-v1 blocks must be an array")
+    return payload
+
+
+def _report_contract_v1_from_html(html_body, prompt, task_id):
+    title = _report_failure_title(prompt)
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    generated_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    slug = _slug_text(title)
+    agent_id = os.environ.get("PAPERCLIP_AGENT_ID") or "paperclip-agent-gateway"
+    workspace = os.environ.get("MONOLITH_TENANT_ID") or os.environ.get("TENANT_ID") or "monolith"
+    contract = {
+        "contract_version": "1",
+        "report_id": f"{slug}-{today}",
+        "stream_id": slug,
+        "kind": "routine-report",
+        "workspace": workspace,
+        "generated_at": generated_at,
+        "period": {"type": "date", "date": today, "label": "Today"},
+        "title": title,
+        "subtitle": "Generated from the deterministic Paperclip report path.",
+        "tags": ["client-ready"],
+        "agent": {"id": agent_id, "instance": os.uname().nodename},
+        "blocks": [
+            {
+                "type": "summary",
+                "headline": title,
+                "body": "Generated report artifact is available in the typed HTML block below.",
+                "tone": "neutral",
+            },
+            {"type": "html", "html": _style_report_document(html_body)},
+            {
+                "type": "provenance",
+                "data": {
+                    "taskId": task_id,
+                    "sourceDocuments": ["Paperclip issue context", ROUTINE_CONTRACTS_PATH],
+                    "routineContractsSha256": _sha256_file(ROUTINE_CONTRACTS_PATH),
+                },
+            },
+        ],
+    }
+    body = json.dumps(contract, separators=(",", ":"), sort_keys=True)
+    _validate_report_contract_v1_body(body)
+    return body
+
+
+def _html_escape(value):
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _declared_script_diagnostics(prompt):
+    diagnostics = []
+    for path in re.findall(r"(?:python3?|/home/agent/hermes-agent/venv/bin/python)\s+(/home/agent/scripts/[A-Za-z0-9_./-]+\.py)", str(prompt or "")):
+        if not os.path.isfile(path):
+            diagnostics.append(f"Declared script is missing on this runtime: {path}")
+    return diagnostics
+
+
+def _report_failure_title(prompt):
+    text = str(prompt or "")
+    for title in (
+        "SCTR Morning Brief",
+        "SCTR Intraday",
+        "SCTR Evening Baseline",
+        "CIC Morning Report",
+        "Morning Prep",
+        "Unified EOD Report",
+        "Alpha Engine Daily Tracker",
+        "Data Pipeline Health",
+        "Routine Run Monitor",
+        "Weekly Research Memo",
+        "COT Weekly",
+    ):
+        if title in text:
+            return title
+    return "Scheduled Report"
+
+
+def _report_document_key(prompt):
+    if "Routine Run Monitor" in str(prompt or ""):
+        return "routine-run-ledger"
+    return "report"
+
+
+def _payload_report_document_key(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    issue = context.get("paperclipIssue") if isinstance(context.get("paperclipIssue"), dict) else {}
+    title = str(issue.get("title") or context.get("title") or "").strip()
+    description = str(issue.get("description") or context.get("description") or "")
+    if title == "Routine Run Monitor" or "Routine Run Monitor" in description:
+        return "routine-run-ledger"
+    return ""
+
+
+def _payload_prefers_report_contract(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    issue = context.get("paperclipIssue") if isinstance(context.get("paperclipIssue"), dict) else {}
+    text = "\n".join(
+        str(part or "")
+        for part in (
+            issue.get("title"),
+            issue.get("description"),
+            context.get("paperclipTaskMarkdown"),
+        )
+        if part
+    ).lower()
+    return REPORT_CONTRACT_V1_KEY in text or "report contract v1" in text
+
+
+def _payload_issue_prompt(payload):
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    issue = context.get("paperclipIssue") if isinstance(context.get("paperclipIssue"), dict) else {}
+    return "\n".join(
+        str(part or "")
+        for part in (
+            issue.get("title"),
+            issue.get("description"),
+            context.get("paperclipTaskMarkdown"),
+        )
+        if part
+    )
+
+
+def _direct_deterministic_report_body(payload):
+    prompt = _payload_issue_prompt(payload)
+    if not prompt:
+        return ""
+    for producer in (
+        _routine_monitor_prompt_html_report,
+        _unified_eod_prompt_html_report,
+        _alpha_engine_prompt_html_report,
+        _data_pipeline_prompt_html_report,
+        _cic_prompt_html_report,
+        _sctr_prompt_html_report,
+    ):
+        body = producer(prompt)
+        if body:
+            return body
+    return ""
+
+
+def _run_direct_deterministic_report(payload, task_id):
+    body = _direct_deterministic_report_body(payload)
+    if not body:
+        return None
+    publish_typed = _payload_prefers_report_contract(payload)
+    key = REPORT_CONTRACT_V1_KEY if publish_typed else (_payload_report_document_key(payload) or "report")
+    format_text = "markdown" if publish_typed else "html"
+    document_body = _report_contract_v1_from_html(body, _payload_issue_prompt(payload), task_id) if publish_typed else body
+    results = _execute_paperclip_tool_calls(
+        [
+            {
+                "tool": "paperclip_put_task_document",
+                "args": {
+                    "issue_id": task_id,
+                    "key": key,
+                    "format": format_text,
+                    "body": document_body,
+                },
+            },
+        ],
+        payload,
+    )
+    required_document_written = _has_report_contract_document_write(results) if publish_typed else _has_report_document_write(results)
+    if required_document_written:
+        results.extend(
+            _execute_paperclip_tool_calls(
+                [
+                    {
+                        "tool": "paperclip_update_task",
+                        "args": {
+                            "issue_id": task_id,
+                            "status": "done",
+                            "comment": f"Deterministic report published to Paperclip key={key}, format={format_text}.",
+                        },
+                    },
+                ],
+                payload,
+            )
+        )
+    ok = required_document_written and _has_task_status_update(results)
+    return {
+        "exitCode": 0 if ok else 1,
+        "stdout": f"Deterministic report path used; documentKey={key}; ok={ok}",
+        "stderr": "" if ok else "Deterministic report tool call failed",
+        "toolResults": results,
+    }
+
+
+def _report_failure_rows(completed, prompt):
+    stdout = str(completed.stdout or "")
+    stderr = str(completed.stderr or "")
+    combined = f"{stdout}\n{stderr}"
+    rows = []
+    if completed.returncode is None or "timed out" in combined.lower():
+        rows.append(("Runtime", "The report runtime timed out before producing a valid Paperclip report document."))
+    if "DANGEROUS COMMAND" in combined:
+        rows.append(("Command Policy", "The agent attempted a denied inline command instead of the declared routine tool path."))
+    if "write() argument must be str, not dict" in combined:
+        rows.append(("Tool Stream", "Hermes hit a tool-stream writer type error while the report run was active."))
+    if "KeyboardInterrupt" in combined:
+        rows.append(("Runtime", "The report process was interrupted before delivery completed."))
+    if "Traceback" in combined and not any(label == "Tool Stream" for label, _ in rows):
+        rows.append(("Runtime", "The report process raised an exception before a trustworthy report was delivered."))
+    for diagnostic in _declared_script_diagnostics(prompt):
+        rows.append(("Declared Data Tool", diagnostic))
+    if not rows:
+        rows.append(("Delivery", "The agent did not emit the required Paperclip document write for this report."))
+    return rows
+
+
+def _fallback_report_document(completed, task_id, prompt=None):
+    raw_stdout = str(completed.stdout or "")
+    task_attr = _html_escape(task_id)
+    report_title = _html_escape(_report_failure_title(prompt))
+    rows = _report_failure_rows(completed, prompt)
+    row_html = "".join(
+        "<tr>"
+        f"<th>{_html_escape(label)}</th>"
+        f"<td>{_html_escape(detail)}</td>"
+        "</tr>"
+        for label, detail in rows
+    )
+    if "DANGEROUS COMMAND" in raw_stdout:
+        return (
+            f'<section class="routine-delivery-status" data-task-id="{task_attr}">'
+            f"<h2>{report_title} — Delivery Blocked</h2>"
+            '<p class="timestamp">Generated by Paperclip gateway fallback</p>'
+            '<div class="summary"><strong>Executive Summary</strong>'
+            "<p>The routine reached the runtime command guard and did not produce the required report. "
+            "This issue is blocked until the agent uses the declared report tool path.</p></div>"
+            "<table>"
+            f"{row_html}"
+            "<tr><th>Report document</th><td>key=report, format=html</td></tr>"
+            "<tr><th>Next run requirement</th><td>Use only the declared routine script/tool path; do not probe packages inline.</td></tr>"
+            "</table>"
+            '<section class="data-sources"><h3>Data Sources</h3><ul>'
+            "<li>Paperclip issue context and gateway runtime diagnostics.</li>"
+            "</ul></section>"
+            "</section>"
+        )[:20000]
+    next_step = (
+        "Install or repair the declared data tool, rerun the routine, and only mark done after a "
+        "real HTML report is attached."
+        if any(label == "Declared Data Tool" for label, _ in rows)
+        else "Rerun the routine after fixing the runtime failure; do not mark done until the report document contains the actual report."
+    )
+    return (
+        f'<section class="routine-delivery-status" data-task-id="{task_attr}">'
+        f"<h2>{report_title} — Delivery Blocked</h2>"
+        '<p class="timestamp">Generated by Paperclip gateway fallback</p>'
+        '<div class="summary"><strong>Executive Summary</strong>'
+        "<p>The scheduled report did not complete, so this document records a clean blocker "
+        "instead of exposing raw terminal output as a report.</p></div>"
+        "<h3>Blocking Evidence</h3>"
+        f"<table>{row_html}</table>"
+        '<section class="notice"><h3>Next Recovery Step</h3>'
+        f"<p>{_html_escape(next_step)}</p></section>"
+        '<section class="data-sources"><h3>Data Sources</h3><ul>'
+        "<li>Paperclip issue context and gateway runtime diagnostics.</li>"
+        "<li>Raw tracebacks and terminal logs are intentionally excluded from report documents.</li>"
+        "</ul></section>"
+        "</section>"
+    )[:20000]
+
+
+def _timeout_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _ensure_report_document(tool_results, completed, payload, task_id, prompt):
+    if not task_id or not _prompt_requires_report_document(prompt):
+        return []
+    requires_contract = _prompt_requires_report_contract(prompt)
+    if requires_contract and _has_report_contract_document_write(tool_results):
+        return []
+    if not requires_contract and _has_report_document_write(tool_results):
+        return []
+    body = _extract_html_report_body(
+        "\n".join(part for part in (completed.stdout or "", completed.stderr or "") if part)
+    )
+    used_fallback = False
+    if not body:
+        body = _read_latest_prompt_html_report(prompt)
+    if not body:
+        body = _cic_prompt_html_report(prompt)
+    if not body:
+        body = _sctr_prompt_html_report(prompt)
+    if not body:
+        body = _data_pipeline_prompt_html_report(prompt)
+    if not body:
+        body = _unified_eod_prompt_html_report(prompt)
+    if not body:
+        body = _alpha_engine_prompt_html_report(prompt)
+    if not body:
+        body = _routine_monitor_prompt_html_report(prompt)
+    if not body:
+        body = _fallback_report_document(completed, task_id, prompt)
+        used_fallback = True
+    document_key = REPORT_CONTRACT_V1_KEY if requires_contract and not used_fallback else _report_document_key(prompt)
+    document_format = "markdown" if document_key == REPORT_CONTRACT_V1_KEY else "html"
+    document_body = _report_contract_v1_from_html(body, prompt, task_id) if document_key == REPORT_CONTRACT_V1_KEY else _style_report_document(body)
+    results = _execute_paperclip_tool_calls(
+        [
+            {
+                "tool": "paperclip_put_task_document",
+                "args": {
+                    "issue_id": task_id,
+                    "key": document_key,
+                    "format": document_format,
+                    "body": document_body,
+                },
+            }
+        ],
+        payload,
+    )
+    required_document_written = _has_report_contract_document_write(results) if document_key == REPORT_CONTRACT_V1_KEY else _has_report_document_write(results)
+    if required_document_written and (used_fallback or not _has_task_status_update(tool_results)):
+        status = "blocked" if used_fallback else "done"
+        comment = (
+            "HTML status document attached to Paperclip key=report, but the actual report was not produced. "
+            "Task left blocked for rerun or investigation."
+            if used_fallback
+            else f"Report document attached to Paperclip key={document_key} with format={document_format}."
+        )
+        results.extend(
+            _execute_paperclip_tool_calls(
+                [
+                    {
+                        "tool": "paperclip_update_task",
+                        "args": {
+                            "issue_id": task_id,
+                            "status": status,
+                            "comment": comment,
+                        },
+                    }
+                ],
+                payload,
+            )
+        )
+    return results
+
+
+def _retry_missing_tool_calls(completed, payload, task_id, run_id, agent_id, company_id, wake_reason, original_prompt):
+    if not task_id:
+        return [], "", ""
+    if _extract_tool_calls(completed.stdout or ""):
+        return [], "", ""
+
+    retry_prompt = (
+        "Your previous Paperclip response did not include any executable tool call, "
+        "so no Paperclip write happened. This is a correction pass. "
+        f"Emit only one or more lines beginning with {TOOL_CALL_PREFIX} followed by JSON. "
+        "Do not explain. Do not acknowledge. Do not use markdown. "
+        "Do not emit read-only tools in this correction pass. "
+        "If the task asks for a report, document, HTML output, or mandatory Paperclip "
+        "document delivery, emit paperclip_put_task_document with issue_id=taskId, "
+        "key set to the declared Paperclip document key when the task names one, otherwise key=report, "
+        "format=markdown and a raw Report Contract v1 JSON body when the declared key is report-contract-v1; "
+        "otherwise format=html and an HTML body. "
+        "If prior stdout shows a blocker or denied command, the HTML body must be a "
+        "blocker/status report with the failed command and next fix. "
+        "If the task asks for a comment, emit paperclip_comment_on_task. "
+        "If the task asks to mark done, also emit paperclip_update_task with status done. "
+        "If the task asks to delegate, emit paperclip_delegate_to_report. "
+        f"Allowed tools: {_allowed_tools_text()}. "
+        f"runId={run_id}; agentId={agent_id}; companyId={company_id}; "
+        f"taskId={task_id}; wakeReason={wake_reason}; "
+        f"assignmentContext={original_prompt[-6000:]}; "
+        f"previousStdout={(completed.stdout or '')[-2000:]}"
+    )
+    try:
+        retry = _run_hermes_prompt(
+            retry_prompt,
+            payload,
+            max(30, min(HERMES_TIMEOUT_SEC, 90)),
+        )
+    except Exception as error:
+        return [], "", str(error)
+    return _execute_paperclip_tools(retry.stdout or "", payload), retry.stdout[-4000:], retry.stderr[-1000:]
+
+
+def _execute_paperclip_tool_calls(calls, payload):
+    results = []
+    for call in calls:
+        if not isinstance(call, dict):
+            results.append({"ok": False, "tool": None, "error": "Paperclip tool call must be a JSON object"})
+            continue
+        if "_parse_error" in call:
+            results.append({"ok": False, "error": call["_parse_error"], "raw": call["_raw"]})
+            continue
+        try:
+            result = _execute_tool_call(call, payload)
+            tool_name = _canonical_tool_name(call)
+            entry = {"ok": True, "tool": tool_name, "result": result}
+            if tool_name == "paperclip_put_task_document":
+                entry["documentKey"] = _document_key_from_call(call, payload)
+            results.append(entry)
+        except Exception as error:
+            results.append({"ok": False, "tool": _canonical_tool_name(call), "error": str(error)})
+    return results
+
+
+def _compact_mapping(value, keys):
+    return {
+        key: value.get(key)
+        for key in keys
+        if isinstance(value, dict) and value.get(key) not in (None, "", [], {})
+    }
+
+
+def _compact_tool_value(value):
+    if isinstance(value, list):
+        return [_compact_tool_value(item) for item in value[:20]]
+    if not isinstance(value, dict):
+        return value
+
+    if "identifier" in value and "title" in value:
+        compact = _compact_mapping(
+            value,
+            (
+                "id",
+                "identifier",
+                "title",
+                "description",
+                "status",
+                "priority",
+                "assigneeAgentId",
+                "assigneeUserId",
+                "projectId",
+                "goalId",
+                "parentId",
+                "checkoutRunId",
+                "updatedAt",
+            ),
+        )
+        if isinstance(compact.get("description"), str):
+            compact["description"] = compact["description"][:2000]
+        return compact
+
+    if "body" in value and ("issueId" in value or "authorAgentId" in value or "authorUserId" in value):
+        compact = _compact_mapping(
+            value,
+            ("id", "issueId", "authorAgentId", "authorUserId", "createdByRunId", "body", "createdAt"),
+        )
+        if isinstance(compact.get("body"), str):
+            compact["body"] = compact["body"][:2000]
+        return compact
+
+    if "routine" in value or "trigger" in value:
+        return {
+            key: _compact_tool_value(item)
+            for key, item in value.items()
+            if key in {"routine", "trigger"}
+        }
+
+    return _compact_mapping(
+        value,
+        (
+            "id",
+            "identifier",
+            "title",
+            "name",
+            "type",
+            "kind",
+            "status",
+            "priority",
+            "role",
+            "reportsTo",
+            "assigneeAgentId",
+            "requestedByAgentId",
+            "projectId",
+            "goalId",
+            "routineId",
+            "triggerId",
+            "cronExpression",
+            "timezone",
+            "createdAt",
+        ),
+    ) or {key: _compact_tool_value(item) for key, item in list(value.items())[:12]}
+
+
+def _compact_tool_results_for_prompt(results):
+    compacted = []
+    for item in results:
+        if not isinstance(item, dict):
+            compacted.append(item)
+            continue
+        compact = {
+            "ok": item.get("ok"),
+            "tool": item.get("tool"),
+        }
+        if "error" in item:
+            compact["error"] = item.get("error")
+        if "result" in item:
+            compact["result"] = _compact_tool_value(item.get("result"))
+        compacted.append({key: value for key, value in compact.items() if value not in (None, "", [], {})})
+    return compacted
+
+
+def _compact_agent(value):
+    return _compact_mapping(
+        value,
+        ("id", "name", "title", "role", "reportsTo", "status", "urlKey", "adapterType"),
+    )
+
+
+def _preload_paperclip_task_context(payload, task_id):
+    company_id = _clean_text(payload.get("companyId") or os.environ.get("PAPERCLIP_COMPANY_ID"), max_len=128)
+    agent_id = _clean_text(payload.get("agentId") or os.environ.get("PAPERCLIP_AGENT_ID"), max_len=128)
+    context = {}
+
+    try:
+        heartbeat_context = _paperclip_request(
+            "GET",
+            f"/issues/{urllib.parse.quote(str(task_id))}/heartbeat-context",
+            agent_id=payload.get("agentId"),
+        )
+        if isinstance(heartbeat_context, dict):
+            issue = heartbeat_context.get("issue")
+            if isinstance(issue, dict):
+                context["issue"] = _compact_tool_value(issue)
+            if isinstance(heartbeat_context.get("commentCursor"), dict):
+                context["commentCursor"] = _compact_mapping(
+                    heartbeat_context["commentCursor"],
+                    ("totalComments", "latestCommentId", "latestCommentAt"),
+                )
+            summary = heartbeat_context.get("continuationSummary")
+            if isinstance(summary, dict) and summary.get("body"):
+                context["continuationSummary"] = str(summary.get("body"))[:2000]
+    except Exception as error:
+        context["issueContextError"] = str(error)
+
+    if company_id:
+        try:
+            agents = _paperclip_request(
+                "GET",
+                f"/companies/{urllib.parse.quote(company_id)}/agents",
+                agent_id=payload.get("agentId"),
+            )
+            if isinstance(agents, list):
+                compact_agents = [_compact_agent(agent) for agent in agents if isinstance(agent, dict)]
+                context["directReports"] = [
+                    agent for agent in compact_agents if str(agent.get("reportsTo") or "") == agent_id
+                ]
+                context["companyAgents"] = compact_agents[:50]
+        except Exception as error:
+            context["agentRosterError"] = str(error)
+
+    return context
+
+
+def _lock_key(payload):
+    return (
+        str(payload.get("logicalAgentId") or "").strip()
+        or str(os.environ.get("MONOLITH_LOGICAL_AGENT_ID") or "").strip()
+        or str(payload.get("agentId") or "").strip()
+        or str(os.environ.get("PAPERCLIP_AGENT_ID") or "").strip()
+        or "default-agent"
+    )
+
+
+def _acquire_lock(payload):
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    lock_key = _lock_key(payload).replace("/", "_")
+    lock_path = os.path.join(LOCK_DIR, f"{lock_key}.lock")
+    started = time.monotonic()
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(
+                json.dumps(
+                    {
+                        "runId": payload.get("runId"),
+                        "agentId": payload.get("agentId"),
+                        "logicalAgentId": payload.get("logicalAgentId"),
+                        "brainId": payload.get("brainId"),
+                        "acquiredAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                    sort_keys=True,
+                )
+            )
+            lock_file.flush()
+            return lock_file, lock_path
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                lock_file.close()
+                raise
+            if time.monotonic() - started >= LOCK_WAIT_SEC:
+                lock_file.close()
+                return None, lock_path
+            time.sleep(0.2)
+
+
+def _release_lock(lock_file):
+    if lock_file is None:
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _run_hermes_prompt(prompt, payload, timeout):
+    cmd = [
+        "sudo",
+        "-E",
+        "-u",
+        "agent",
+        "/home/agent/hermes-agent/venv/bin/python",
+        "-m",
+        "hermes_cli.main",
+        "chat",
+        "-Q",
+        "--source",
+        "paperclip",
+        "-q",
+        prompt,
+    ]
+    process = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_hermes_env(payload),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        error.stdout = stdout
+        error.stderr = stderr
+        raise error
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def run_hermes(payload):
+    run_id = payload.get("runId")
+    agent_id = payload.get("agentId")
+    company_id = payload.get("companyId")
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    compact_context = _compact_prompt_context(payload)
+    task_id = context.get("taskId") or payload.get("taskId")
+    wake_reason = context.get("wakeReason") or payload.get("wakeReason")
+    if task_id:
+        preloaded_paperclip_context = _preload_paperclip_task_context(payload, task_id)
+        preloaded_issue = (
+            preloaded_paperclip_context.get("issue")
+            if isinstance(preloaded_paperclip_context, dict)
+            and isinstance(preloaded_paperclip_context.get("issue"), dict)
+            else {}
+        )
+        if preloaded_issue.get("status") in {"cancelled", "done"}:
+            return {
+                "exitCode": 0,
+                "stdout": f"Skipping stale wake for terminal Paperclip task {task_id}.",
+                "stderr": "",
+                "toolResults": [],
+            }
+        prompt = (
+            "Paperclip invoked you through the Monolith HTTP adapter. "
+            "Treat Paperclip as the source of truth for task assignment and reporting. "
+            "Do not ask for clarification. "
+            "Do not run inline Python with -c/-e, package probes, or ad hoc scripts; "
+            "those commands are denied in this runtime. Use the task's declared "
+            "script/tool commands exactly, or emit the required Paperclip write "
+            "for the task when the declared path is blocked. "
+            "The assigned task context and your direct-report roster are already preloaded; "
+            "act from that context before using Paperclip read tools. For Paperclip writes, do not use "
+            "curl or raw HTTP. Instead emit exactly one line beginning with "
+            f"{TOOL_CALL_PREFIX} followed by JSON. Allowed tools: {_allowed_tools_text()}. "
+            "If the assigned task asks you to comment, report, delegate, update, close, "
+            "or create Paperclip work, emitting the matching tool call is required; "
+            "a plain acknowledgement without a tool call is a failed run. "
+            "Use directReports when delegating to reports. "
+            "Then respond concisely with the task/run status and next action. "
+            f"runId={run_id}; agentId={agent_id}; companyId={company_id}; "
+            f"taskId={task_id}; wakeReason={wake_reason}; "
+            f"context={json.dumps(compact_context, sort_keys=True, separators=(',', ':'))}; "
+            f"paperclipContext={json.dumps(preloaded_paperclip_context, sort_keys=True, separators=(',', ':'))}"
+        )
+    else:
+        prompt = (
+            "Paperclip invoked you through the Monolith HTTP adapter, but no taskId was "
+            "provided for this wake. If the operator explicitly asks you to create, "
+            "delegate, report, or comment in Paperclip, emit exactly one line beginning "
+            f"with {TOOL_CALL_PREFIX} followed by JSON for one of these allowed tools: "
+            f"{_allowed_tools_text()}. Otherwise respond "
+            "briefly that you are online, ready for assignment, and waiting for a "
+            "Paperclip task. "
+            f"runId={run_id}; agentId={agent_id}; companyId={company_id}; "
+            f"wakeReason={wake_reason}; "
+            f"context={json.dumps(compact_context, sort_keys=True, separators=(',', ':'))}"
+        )
+    direct_tool_calls = context.get("paperclipToolCalls")
+    direct_deterministic = None if direct_tool_calls else _run_direct_deterministic_report(payload, task_id) if task_id else None
+    if direct_deterministic is not None:
+        completed = subprocess.CompletedProcess(
+            [],
+            direct_deterministic["exitCode"],
+            stdout=direct_deterministic["stdout"],
+            stderr=direct_deterministic["stderr"],
+        )
+        tool_results = direct_deterministic["toolResults"]
+        report_document_results = []
+    elif isinstance(direct_tool_calls, list) and direct_tool_calls:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        tool_results = _execute_paperclip_tool_calls(direct_tool_calls, payload)
+        report_document_results = []
+    else:
+        try:
+            completed = _run_hermes_prompt(prompt, payload, HERMES_TIMEOUT_SEC)
+            tool_results = _execute_paperclip_tools(completed.stdout or "", payload)
+            if not tool_results:
+                retry_results, retry_stdout, retry_stderr = _retry_missing_tool_calls(
+                    completed,
+                    payload,
+                    task_id,
+                    run_id,
+                    agent_id,
+                    company_id,
+                    wake_reason,
+                    prompt,
+                )
+                if retry_results:
+                    tool_results = retry_results
+                    completed = subprocess.CompletedProcess(
+                        completed.args,
+                        completed.returncode,
+                        stdout=(completed.stdout or "")
+                        + "\n\n--- Paperclip missing-tool retry ---\n"
+                        + retry_stdout,
+                        stderr=(completed.stderr or "") + ("\n" + retry_stderr if retry_stderr else ""),
+                    )
+                elif retry_stderr:
+                    completed = subprocess.CompletedProcess(
+                        completed.args,
+                        completed.returncode,
+                        stdout=completed.stdout,
+                        stderr=(completed.stderr or "") + "\n" + retry_stderr,
+                    )
+        except subprocess.TimeoutExpired as error:
+            completed = subprocess.CompletedProcess(
+                getattr(error, "cmd", []),
+                None,
+                stdout=_timeout_text(error.stdout),
+                stderr=("Hermes invocation timed out" + ("\n" + _timeout_text(error.stderr) if error.stderr else "")),
+            )
+            tool_results = []
+        report_document_results = _ensure_report_document(
+            tool_results,
+            completed,
+            payload,
+            task_id,
+            prompt,
+        )
+        if report_document_results:
+            tool_results = [*tool_results, *report_document_results]
+            if completed.returncode is None and _has_report_document_write(report_document_results):
+                completed = subprocess.CompletedProcess(
+                    completed.args,
+                    0,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                )
+    followup_stdout = ""
+    followup_stderr = ""
+    if tool_results and not report_document_results:
+        compact_tool_results = _compact_tool_results_for_prompt(tool_results)
+        followup_prompt = (
+            "Paperclip gateway tool results are now available. Do not emit any "
+            f"{TOOL_CALL_PREFIX} lines. Use these results to answer the operator, "
+            "including identifiers, status, assignee, comments, delivery expectations, "
+            "and next follow-up. "
+            f"Original run context: runId={run_id}; agentId={agent_id}; companyId={company_id}; "
+            f"taskId={task_id}; wakeReason={wake_reason}. "
+            f"toolResults={json.dumps(compact_tool_results, sort_keys=True, default=str)}"
+        )
+        try:
+            followup = _run_hermes_prompt(
+                followup_prompt,
+                payload,
+                max(30, min(HERMES_TIMEOUT_SEC, 90)),
+            )
+            followup_stdout = followup.stdout[-4000:]
+            followup_stderr = followup.stderr[-1000:]
+        except Exception as error:
+            followup_stderr = str(error)
+    return {
+        "exitCode": completed.returncode,
+        "stdout": ((completed.stdout or "") + ("\n\n--- Paperclip tool follow-up ---\n" + followup_stdout if followup_stdout else ""))[-8000:],
+        "stderr": ((completed.stderr or "") + ("\n" + followup_stderr if followup_stderr else ""))[-4000:],
+        "toolResults": tool_results,
+    }
+
+
+def _enqueue_wake(payload):
+    os.makedirs(QUEUE_DIR, exist_ok=True)
+    enqueued_at = time.time()
+    run_id = payload.get("runId") or hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    filename = f"{int(enqueued_at * 1000)}-{run_id}.json"
+    tmp_path = os.path.join(QUEUE_DIR, f".{filename}.tmp")
+    final_path = os.path.join(QUEUE_DIR, filename)
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump({"enqueuedAt": enqueued_at, "payload": payload}, handle)
+    os.rename(tmp_path, final_path)
+    return {"queuePath": final_path, "runId": run_id, "enqueuedAt": enqueued_at}
+
+
+def _drain_queue_once():
+    if not os.path.isdir(QUEUE_DIR):
+        return 0
+    processed = 0
+    for entry in sorted(os.listdir(QUEUE_DIR)):
+        if entry.startswith("."):
+            continue
+        path = os.path.join(QUEUE_DIR, entry)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                envelope = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        payload = envelope.get("payload") or {}
+        lock_file, lock_path = _acquire_lock(payload)
+        if lock_file is None:
+            return processed
+        try:
+            started = time.time()
+            try:
+                hermes = run_hermes(payload)
+            except subprocess.TimeoutExpired as error:
+                hermes = {
+                    "exitCode": None,
+                    "stdout": (error.stdout or "")[-8000:] if isinstance(error.stdout, str) else "",
+                    "stderr": "Hermes invocation timed out",
+                    "toolResults": [],
+                }
+            except Exception as error:
+                hermes = {
+                    "exitCode": None,
+                    "stdout": "",
+                    "stderr": str(error),
+                    "toolResults": [],
+                }
+            record = {
+                "receivedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "durationSec": round(time.time() - started, 3),
+                "lockPath": lock_path,
+                "mode": "async",
+                "payload": payload,
+                "hermes": hermes,
+            }
+            try:
+                os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+                with open(LOG_PATH, "a", encoding="utf-8") as log:
+                    log.write(json.dumps(record, sort_keys=True) + "\n")
+            except OSError:
+                pass
+        finally:
+            _release_lock(lock_file)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        processed += 1
+    return processed
+
+
+def _worker_loop():
+    while True:
+        try:
+            _drain_queue_once()
+        except Exception:
+            pass
+        time.sleep(WORKER_POLL_SEC)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "monolith-paperclip-gateway/1.0"
+
+    def _send_json(self, status, body):
+        payload = json.dumps(body, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "runtime": "hermes",
+                    "paperclipAgentId": os.environ.get("PAPERCLIP_AGENT_ID"),
+                    "paperclipCompanyId": os.environ.get("PAPERCLIP_COMPANY_ID"),
+                },
+            )
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        if self.path != "/paperclip/wake":
+            self._send_json(404, {"error": "not_found"})
+            return
+
+        length = int(self.headers.get("content-length", "0") or "0")
+        raw = self.rfile.read(length)
+        auth_error = _verify_request_auth(self.headers, raw)
+        if auth_error:
+            self._send_json(401, {"error": auth_error})
+            return
+
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+
+        if GATEWAY_MODE == "async":
+            try:
+                enq = _enqueue_wake(payload)
+            except OSError as error:
+                self._send_json(
+                    500,
+                    {
+                        "error": "enqueue_failed",
+                        "runtime": "hermes",
+                        "mode": "async",
+                        "detail": str(error),
+                    },
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "runtime": "hermes",
+                    "mode": "async",
+                    "agentId": payload.get("agentId"),
+                    "runId": payload.get("runId") or enq["runId"],
+                    "companyId": payload.get("companyId"),
+                    "logicalAgentId": payload.get("logicalAgentId") or os.environ.get("MONOLITH_LOGICAL_AGENT_ID"),
+                    "brainId": payload.get("brainId") or os.environ.get("MONOLITH_BRAIN_ID"),
+                    "queuedAt": enq["enqueuedAt"],
+                },
+            )
+            return
+
+        lock_file, lock_path = _acquire_lock(payload)
+        if lock_file is None:
+            self._send_json(
+                409,
+                {
+                    "error": "agent_busy",
+                    "runtime": "hermes",
+                    "agentId": payload.get("agentId"),
+                    "runId": payload.get("runId"),
+                    "logicalAgentId": payload.get("logicalAgentId") or os.environ.get("MONOLITH_LOGICAL_AGENT_ID"),
+                    "lockPath": lock_path,
+                },
+            )
+            return
+
+        started = time.time()
+        try:
+            hermes = run_hermes(payload)
+            ok = hermes["exitCode"] == 0
+        except subprocess.TimeoutExpired as error:
+            hermes = {
+                "exitCode": None,
+                "stdout": (error.stdout or "")[-8000:] if isinstance(error.stdout, str) else "",
+                "stderr": "Hermes invocation timed out",
+                "toolResults": [],
+            }
+            ok = False
+        except Exception as error:
+            hermes = {"exitCode": None, "stdout": "", "stderr": str(error), "toolResults": []}
+            ok = False
+
+        record = {
+            "receivedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "durationSec": round(time.time() - started, 3),
+            "lockPath": lock_path,
+            "payload": payload,
+            "hermes": hermes,
+        }
+        try:
+            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+            with open(LOG_PATH, "a", encoding="utf-8") as log:
+                log.write(json.dumps(record, sort_keys=True) + "\n")
+        finally:
+            _release_lock(lock_file)
+
+        self._send_json(
+            200 if ok else 502,
+            {
+                "ok": ok,
+                "runtime": "hermes",
+                "agentId": payload.get("agentId"),
+                "runId": payload.get("runId"),
+                "companyId": payload.get("companyId"),
+                "logicalAgentId": payload.get("logicalAgentId") or os.environ.get("MONOLITH_LOGICAL_AGENT_ID"),
+                "brainId": payload.get("brainId") or os.environ.get("MONOLITH_BRAIN_ID"),
+                "hermesExitCode": hermes["exitCode"],
+                "hermesOutput": hermes["stdout"][-2000:],
+                "hermesError": hermes["stderr"][-1000:],
+                "paperclipToolResults": hermes.get("toolResults", []),
+            },
+        )
+
+
+if __name__ == "__main__":
+    if GATEWAY_MODE == "async":
+        import threading
+
+        threading.Thread(target=_worker_loop, daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

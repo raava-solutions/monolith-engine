@@ -1,0 +1,24 @@
+[Unit]
+Description=Monolith Hermes HUD Collector — {{ agent_name }}
+After=network-online.target {{ runtime_gateway_service | default("hermes-gateway") }}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/home/agent
+Environment=HOME=/home/agent
+Environment=PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MONOLITH_HERMES_HOME={{ hermes_home | default("/home/agent/.hermes") }}
+Environment=MONOLITH_GATEWAY_SERVICE={{ runtime_gateway_service | default("hermes-gateway") }}
+Environment=MONOLITH_HUD_TENANT_ID={{ tenant_id }}
+Environment=MONOLITH_HUD_AGENT_NAME={{ agent_slug }}
+Environment=MONOLITH_HUD_CONTAINER_ID={{ container_name }}
+Environment=MONOLITH_ENV={{ stage | default("production") }}
+{% if hud_ingest_url is defined and hud_ingest_url %}
+Environment=MONOLITH_HUD_INGEST_URL={{ hud_ingest_url | env_value }}
+{% endif %}
+{% if secrets_mode == "env" %}
+EnvironmentFile=/etc/hermes/{{ agent_slug }}.env
+{% endif %}
+ExecStart=/usr/bin/python3 /etc/hermes/monolith-hud-collector.py --post

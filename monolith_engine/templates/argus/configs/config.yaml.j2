@@ -1,0 +1,42 @@
+model:
+  provider: {{ model_provider | default('openrouter') }}
+  default: {{ model }}
+{% if model_provider == 'openrouter' %}
+  base_url: https://openrouter.ai/api/v1
+{% elif model_provider == 'minimax' %}
+  base_url: https://api.minimax.io/anthropic
+{% elif model_provider == 'moonshot' %}
+  base_url: https://api.moonshot.ai/v1
+{% elif model_provider == 'ollama' %}
+  base_url: {{ model_base_url | default('http://host.docker.internal:11434/v1') }}
+{% elif model_provider == 'endpoint' %}
+  base_url: {{ model_base_url }}
+{% endif %}
+toolsets:
+- hermes-cli
+- fleet-api-mcp
+agent:
+  max_turns: 90
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+display:
+  compact: false
+  personality: {{ personality | default('professional') }}
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+timezone: {{ timezone | default('America/New_York') }}
+mcp_servers:
+  monolith-fleet:
+    enabled: true
+    url: {{ fleet_api_url | default(fleet_api_url_default) }}/mcp
+    headers:
+      Authorization: "Bearer ${FLEET_API_TOKEN}"
+security:
+  redact_secrets: true
+  tirith_enabled: true
+policy:
+  write_mode: {{ write_mode | default('proposal_only') }}
+_config_version: 9

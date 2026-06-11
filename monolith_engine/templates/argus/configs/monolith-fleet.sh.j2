@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_FLEET_API_URL="{{ fleet_api_url | default(fleet_api_url_default) }}"
+MONOLITH_API_URL="${MONOLITH_API_URL:-${FLEET_API_URL:-$DEFAULT_FLEET_API_URL}}"
+MONOLITH_FLEET_OUTPUT="${MONOLITH_FLEET_OUTPUT:-toon+evidence}"
+FLEET_OPERATOR_WRITE_MODE="${FLEET_OPERATOR_WRITE_MODE:-proposal_only}"
+
+WRITE_COMMANDS=(
+  "provision"
+  "deploy"
+  "containers delete"
+  "containers restart"
+  "containers stop"
+  "containers start"
+  "snapshots create"
+  "snapshots delete"
+  "snapshots restore"
+  "runtime update"
+  "agents delete"
+  "migrations run"
+  "reconcile run"
+)
+
+is_write_command() {
+  local cmd="$1"
+  for wc in "${WRITE_COMMANDS[@]}"; do
+    [[ "$cmd" == "$wc"* ]] && return 0
+  done
+  return 1
+}
+
+MONOLITH_ARGS=("--api-url" "$MONOLITH_API_URL")
+if [[ "${MONOLITH_FLEET_OUTPUT%%+*}" == "json" ]]; then
+  MONOLITH_ARGS+=("--json")
+fi
+
+CMD_STRING="${*:-}"
+if [[ "$FLEET_OPERATOR_WRITE_MODE" == "proposal_only" ]] && is_write_command "$CMD_STRING"; then
+  echo "[monolith-fleet] WRITE GUARD: proposal_only mode" >&2
+  echo "## Fleet Proposal"
+  echo "**Action**: monolith $CMD_STRING"
+  echo "**Mode**: proposal_only"
+  echo "**API**: $MONOLITH_API_URL"
+  echo "**Required approval**: operator approval before execution"
+  exit 0
+fi
+
+exec monolith "${MONOLITH_ARGS[@]}" "$@"

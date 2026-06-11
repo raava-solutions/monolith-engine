@@ -1,0 +1,9 @@
+{
+  "monolith-fleet": {
+    "enabled": true,
+    "url": "{{ fleet_api_url | default('https://api.fleetos.raavasolutions.com') }}/mcp",
+    "headers": {
+      "Authorization": "Bearer ${FLEET_API_TOKEN}"
+    }
+  }
+}

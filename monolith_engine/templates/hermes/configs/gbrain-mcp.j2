@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# gbrain-mcp — uniform CLI shim over hosted gbrain MCP for Raava fleet agents.
+#
+# Goal: agents call `gbrain query "..."`, `gbrain search "..."`, `gbrain stats`,
+# etc. without any auth dance in agent code. This wrapper handles:
+#   - Cloud Run IAM identity token (X-Serverless-Authorization) via GCE metadata
+#     when running inside GCP, or via gcloud when running locally.
+#   - gbrain OAuth client_credentials grant against /token, with a short-lived
+#     token cache at ${XDG_RUNTIME_DIR:-/tmp}/gbrain-token-<hash>.
+#   - JSON-RPC MCP calls against /mcp with Authorization: Bearer <oauth-token>.
+#
+# Deploy as /usr/local/bin/gbrain on fleet VMs. Local Mac agents use the real
+# gbrain CLI against PGLite; this wrapper is for hosted runtimes that can't
+# carry the full bun/postgres footprint.
+#
+# Env:
+#   GBRAIN_URL              Cloud Run service URL (default: prod hosted gbrain)
+#   GBRAIN_CLIENT_ID        OAuth client ID (read-only)
+#   GBRAIN_CLIENT_SECRET    OAuth client secret
+#   GBRAIN_GCP              "1" to force metadata-server ID token path
+#   GBRAIN_LOCAL_PROXY      "1" to skip identity token (talking to localhost proxy)
+#   GBRAIN_DEBUG            "1" to print curl details to stderr
+
+set -uo pipefail
+
+GBRAIN_URL="${GBRAIN_URL:-https://raava-brain-gbrain-lmbn6fkciq-ue.a.run.app}"
+TOKEN_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+
+die() { echo "gbrain: $*" >&2; exit 1; }
+
+dbg() { [[ "${GBRAIN_DEBUG:-0}" == "1" ]] && echo "gbrain[dbg]: $*" >&2 || true; }
+
+require_creds() {
+  [[ -n "${GBRAIN_CLIENT_ID:-}" ]] || die "GBRAIN_CLIENT_ID not set"
+  [[ -n "${GBRAIN_CLIENT_SECRET:-}" ]] || die "GBRAIN_CLIENT_SECRET not set"
+}
+
+token_cache_path() {
+  local hash
+  hash=$(printf '%s' "${GBRAIN_URL}|${GBRAIN_CLIENT_ID}" | shasum | awk '{print substr($1,1,16)}')
+  printf '%s/gbrain-token-%s.json' "${TOKEN_DIR}" "${hash}"
+}
+
+# Returns X-Serverless-Authorization header value (or empty string for local proxy).
+mint_id_token() {
+  if [[ "${GBRAIN_LOCAL_PROXY:-0}" == "1" ]]; then
+    echo ""
+    return 0
+  fi
+
+  # GCP metadata server path
+  if [[ "${GBRAIN_GCP:-0}" == "1" ]] || curl -sf -m 1 -H 'Metadata-Flavor: Google' \
+      "http://metadata.google.internal/computeMetadata/v1/instance/" >/dev/null 2>&1; then
+    curl -fsS -H 'Metadata-Flavor: Google' \
+      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${GBRAIN_URL}&format=full"
+    return 0
+  fi
+
+  # Local fallback: gcloud
+  if command -v gcloud >/dev/null 2>&1; then
+    gcloud auth print-identity-token "--audiences=${GBRAIN_URL}" 2>/dev/null || \
+      die "gcloud auth print-identity-token failed; run 'gcloud auth login'"
+    return 0
+  fi
+
+  die "no path to Cloud Run identity token (not in GCP and no gcloud)"
+}
+
+# Returns OAuth access token, using cache when fresh.
+mint_oauth_token() {
+  require_creds
+  local cache_path
+  cache_path=$(token_cache_path)
+
+  local now
+  now=$(date +%s)
+
+  if [[ -f "${cache_path}" ]]; then
+    local cached_expiry
+    cached_expiry=$(jq -r '.expires_at // 0' "${cache_path}" 2>/dev/null || echo 0)
+    if (( cached_expiry > now + 30 )); then
+      jq -r '.access_token' "${cache_path}"
+      return 0
+    fi
+  fi
+
+  local id_token
+  id_token=$(mint_id_token)
+
+  local headers=(
+    -H 'Content-Type: application/x-www-form-urlencoded'
+  )
+  if [[ -n "${id_token}" ]]; then
+    headers+=(-H "X-Serverless-Authorization: Bearer ${id_token}")
+  fi
+
+  local body
+  body=$(curl -fsS -X POST "${GBRAIN_URL}/token" \
+    "${headers[@]}" \
+    -d 'grant_type=client_credentials' \
+    --data-urlencode "client_id=${GBRAIN_CLIENT_ID}" \
+    --data-urlencode "client_secret=${GBRAIN_CLIENT_SECRET}" \
+    -d 'scope=read') || die "OAuth /token failed"
+
+  local access_token expires_in
+  access_token=$(jq -r '.access_token' <<<"${body}")
+  expires_in=$(jq -r '.expires_in // 3600' <<<"${body}")
+
+  [[ -n "${access_token}" && "${access_token}" != "null" ]] || die "no access_token in /token response: ${body}"
+
+  local expires_at=$(( now + expires_in ))
+  printf '{"access_token":"%s","expires_at":%d}\n' "${access_token}" "${expires_at}" >"${cache_path}"
+  chmod 600 "${cache_path}"
+
+  echo "${access_token}"
+}
+
+# Generic MCP tools/call. $1 = tool name, $2 = JSON args object.
+mcp_call() {
+  local tool="$1"
+  local args_json="$2"
+
+  local oauth_token id_token
+  oauth_token=$(mint_oauth_token)
+  id_token=$(mint_id_token)
+
+  local headers=(
+    -H 'Content-Type: application/json'
+    -H 'Accept: application/json, text/event-stream'
+    -H "Authorization: Bearer ${oauth_token}"
+  )
+  if [[ -n "${id_token}" ]]; then
+    headers+=(-H "X-Serverless-Authorization: Bearer ${id_token}")
+  fi
+
+  local payload
+  payload=$(jq -nc \
+    --arg method 'tools/call' \
+    --arg tool "${tool}" \
+    --argjson args "${args_json}" \
+    '{jsonrpc:"2.0",id:1,method:$method,params:{name:$tool,arguments:$args}}')
+
+  dbg "POST ${GBRAIN_URL}/mcp tool=${tool} args=${args_json}"
+
+  local resp
+  resp=$(curl -fsS -X POST "${GBRAIN_URL}/mcp" \
+    "${headers[@]}" \
+    --data "${payload}") || die "MCP /mcp call failed for tool ${tool}"
+
+  # Result may be in JSON-RPC envelope or SSE; try JSON first.
+  if jq -e '.result' >/dev/null 2>&1 <<<"${resp}"; then
+    jq '.result' <<<"${resp}"
+  else
+    # Strip SSE prefixes if present.
+    grep -E '^(data:|event:)' <<<"${resp}" | sed 's/^data: //' | jq '.result // .' 2>/dev/null || echo "${resp}"
+  fi
+}
+
+usage() {
+  cat <<EOF
+gbrain (hosted MCP shim) — read-only Raava Brain access for fleet agents.
+
+USAGE
+  gbrain query <question>             Hybrid search (RRF + expansion). Default for agents.
+  gbrain search <keywords>            Keyword (tsvector) search
+  gbrain stats                        Brain statistics
+  gbrain doctor                       Health check
+  gbrain get <slug>                   Read a page
+  gbrain list [--type T] [--tag T]    List pages
+  gbrain backlinks <slug>             Incoming links to a page
+  gbrain graph <slug> [--depth N]     Traverse link graph
+  gbrain timeline [<slug>]            Timeline entries
+  gbrain call <tool> '<json-args>'    Raw MCP tool call
+
+ENV
+  GBRAIN_URL              Hosted gbrain URL (default: prod)
+  GBRAIN_CLIENT_ID        OAuth read-only client (required)
+  GBRAIN_CLIENT_SECRET    OAuth read-only client secret (required)
+  GBRAIN_GCP=1            Force GCE metadata path for identity token
+  GBRAIN_LOCAL_PROXY=1    Skip identity token (Cloud Run proxy on localhost)
+  GBRAIN_DEBUG=1          Verbose curl logging on stderr
+EOF
+}
+
+cmd="${1:-}"
+[[ -z "${cmd}" || "${cmd}" == "-h" || "${cmd}" == "--help" ]] && { usage; exit 0; }
+shift
+
+case "${cmd}" in
+  query)
+    [[ $# -ge 1 ]] || die "usage: gbrain query <question>"
+    mcp_call query "$(jq -nc --arg q "$*" '{query:$q}')"
+    ;;
+  search)
+    [[ $# -ge 1 ]] || die "usage: gbrain search <keywords>"
+    mcp_call search "$(jq -nc --arg q "$*" '{query:$q}')"
+    ;;
+  stats)
+    mcp_call get_stats '{}'
+    ;;
+  doctor|health)
+    mcp_call run_doctor '{}'
+    ;;
+  get)
+    [[ $# -ge 1 ]] || die "usage: gbrain get <slug>"
+    mcp_call get_page "$(jq -nc --arg s "$1" '{slug:$s}')"
+    ;;
+  list)
+    args='{}'
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --type) args=$(jq -c --arg v "$2" '. + {type:$v}' <<<"${args}"); shift 2;;
+        --tag)  args=$(jq -c --arg v "$2" '. + {tag:$v}'  <<<"${args}"); shift 2;;
+        -n)     args=$(jq -c --arg v "$2" '. + {limit:($v|tonumber)}' <<<"${args}"); shift 2;;
+        *)      shift;;
+      esac
+    done
+    mcp_call list_pages "${args}"
+    ;;
+  backlinks)
+    [[ $# -ge 1 ]] || die "usage: gbrain backlinks <slug>"
+    mcp_call get_backlinks "$(jq -nc --arg s "$1" '{slug:$s}')"
+    ;;
+  graph)
+    [[ $# -ge 1 ]] || die "usage: gbrain graph <slug> [--depth N]"
+    slug="$1"; shift
+    depth=2
+    [[ "${1:-}" == "--depth" && -n "${2:-}" ]] && depth="$2"
+    mcp_call traverse_graph "$(jq -nc --arg s "${slug}" --argjson d "${depth}" '{slug:$s,depth:$d}')"
+    ;;
+  timeline)
+    args='{}'
+    [[ $# -ge 1 ]] && args=$(jq -nc --arg s "$1" '{slug:$s}')
+    mcp_call get_timeline "${args}"
+    ;;
+  call)
+    [[ $# -ge 2 ]] || die "usage: gbrain call <tool> '<json-args>'"
+    mcp_call "$1" "$2"
+    ;;
+  --version|version)
+    echo "gbrain-mcp-shim 0.1.0 (hosted: ${GBRAIN_URL})"
+    ;;
+  *)
+    die "unknown command: ${cmd} (try --help)"
+    ;;
+esac

@@ -1,0 +1,79 @@
+model:
+  provider: {{ ('custom' if model_provider in ('ollama', 'endpoint') else (model_provider | default('openrouter'))) | tojson }}
+  default: {{ (model | default('minimax/minimax-m2.5')) | tojson }}
+{% if model_provider == 'openrouter' %}
+{% if trace_enabled is defined and trace_enabled and observability_proxy_url is defined and observability_proxy_url %}
+  base_url: {{ observability_proxy_url | tojson }}
+{% else %}
+  base_url: https://openrouter.ai/api/v1
+{% endif %}
+{% elif model_provider == 'minimax' %}
+  base_url: https://api.minimax.io/anthropic
+{% elif model_provider == 'moonshot' %}
+  base_url: https://api.moonshot.ai/v1
+{% elif model_provider == 'ollama' %}
+  base_url: {{ (model_base_url | default('http://host.docker.internal:11434/v1')) | tojson }}
+{% elif model_provider == 'endpoint' %}
+  base_url: {{ model_base_url | tojson }}
+{% endif %}
+toolsets:
+- hermes-cli
+agent:
+  max_turns: 90
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+browser:
+  inactivity_timeout: 120
+  record_sessions: false
+checkpoints:
+  enabled: false
+compression:
+  enabled: true
+  threshold: 0.5
+  summary_model: google/gemini-3-flash-preview
+  summary_provider: auto
+display:
+  compact: false
+  personality: {{ (personality | default('professional')) | tojson }}
+  resume_display: full
+  bell_on_complete: false
+  show_reasoning: false
+  skin: default
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+timezone: {{ (timezone | default('America/New_York')) | tojson }}
+{% if aurum_steering_enabled is defined and aurum_steering_enabled and stage is defined and stage == 'staging' %}
+plugins:
+  enabled:
+    - aurum-steering
+{% endif %}
+{% if discord_channel is defined and discord_channel %}
+discord:
+  require_mention: true
+{% endif %}
+security:
+  redact_secrets: true
+  tirith_enabled: true
+runtime:
+  envelope: {{ (runtime_envelope | default('hermes_alpha')) | tojson }}
+  contract_version: {{ (runtime_contract_version | default('1')) | tojson }}
+  hermes_home: {{ (hermes_home | default('/home/agent/.hermes')) | tojson }}
+  gateway_service: {{ (runtime_gateway_service | default('hermes-gateway')) | tojson }}
+  persistent_paths: {{ (runtime_persistent_paths | default('/home/agent/.hermes,/home/agent/.config/hermes,/home/agent/workspace')) | tojson }}
+  sidecar_services: {{ (runtime_sidecar_services | default('')) | tojson }}
+  health_command: {{ (runtime_health_command | default('systemctl is-active --quiet hermes-gateway && test -d /home/agent/.hermes')) | tojson }}
+hud:
+  enabled: {{ hud_enabled | default(true) | tojson }}
+  sample_interval_seconds: {{ hud_sample_interval_seconds | default(60) }}
+  ingest_url: {{ (hud_ingest_url | default('')) | tojson }}
+camel_guard:
+  requested_mode: {{ (camel_guard_requested_mode | default(camel_guard_mode | default('off'))) | tojson }}
+  effective_mode: {{ (camel_guard_effective_mode | default('off')) | tojson }}
+  enforcement_enabled: {{ (camel_guard_enforcement_enabled | default(false)) | tojson }}
+  source: monolith-fleet-api
+_config_version: 8

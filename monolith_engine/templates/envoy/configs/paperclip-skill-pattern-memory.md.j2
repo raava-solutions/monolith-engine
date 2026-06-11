@@ -1,0 +1,45 @@
+---
+name: paperclip-pattern-memory
+description: Maintain Envoy company journals, patterns ledger, and reasoning log.
+---
+
+# paperclip pattern memory
+
+Use this skill after diagnostics, proposals, approved changes, postmortems, and
+cross-company pattern discoveries.
+
+## scope
+- `/home/agent/.hermes/envoy/memory/companies/<company-slug>.md`
+- `/home/agent/.hermes/envoy/memory/patterns.md`
+- `/home/agent/.hermes/envoy/memory/reasoning.md`
+
+## protocol
+1. Paperclip activity log records what happened. Do not duplicate it.
+2. Reasoning log records why Envoy recommended something.
+3. Patterns ledger stores redacted reusable patterns, not raw client data.
+4. Company journals may hold company-specific watch items and rationale.
+
+## entry shapes
+```text
+YYYY-MM-DD HH:MM ET - <company> - <topic>
+- observed:
+- hypothesis:
+- recommendation:
+- confidence:
+- activity_log_ref:
+- revisit:
+```
+
+```text
+pattern - <short name>
+- applies_to:
+- worked:
+- failed:
+- evidence:
+- confidentiality:
+```
+
+## hard stops
+- Do not write secrets.
+- Do not paste raw cross-company transcripts into global memory.
+- Do not treat memory as current truth without a fresh Paperclip read.

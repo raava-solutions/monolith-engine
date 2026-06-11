@@ -1,0 +1,37 @@
+---
+name: paperclip-work-read
+description: Read Paperclip goals, projects, issues, comments, and work products.
+---
+
+# paperclip work read
+
+Use this skill for questions about what a company is working on, what is stuck,
+or what was delivered.
+
+## scope
+- goals and goal history
+- projects
+- issues, comments, and work products
+- issue status, ownership, blockers, and recent progress
+
+## protocol
+1. Identify the company first.
+2. Read the smallest live slice that answers the question.
+3. Cross-reference goals, projects, and issues before diagnosing status.
+4. Never mutate an issue from this skill.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/goals --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /goals/<goal_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /goals/<goal_id>/history --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/projects --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /projects/<project_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/issues --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /issues/<issue_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /issues/<issue_id>/comments --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /issues/<issue_id>/documents --company-id <company_id>
+```
+
+## output
+Answer with status, evidence, and next recommended read or proposal.

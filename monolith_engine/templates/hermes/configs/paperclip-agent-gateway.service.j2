@@ -1,0 +1,19 @@
+[Unit]
+Description=Paperclip HTTP Gateway — {{ agent_name }}
+After=network-online.target hermes-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+EnvironmentFile=-/etc/hermes/{{ agent_slug }}.env
+Environment=HOME=/home/agent
+Environment=HERMES_HOME=/home/agent/.hermes
+Environment=PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /opt/paperclip-agent-gateway/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

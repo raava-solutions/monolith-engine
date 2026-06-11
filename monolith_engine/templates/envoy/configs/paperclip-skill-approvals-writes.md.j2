@@ -1,0 +1,41 @@
+---
+name: paperclip-approvals-writes
+description: Draft and execute approval-gated Paperclip mutations for Envoy.
+---
+
+# paperclip approvals writes
+
+Use this skill for any Paperclip state change. This is the only write lane.
+
+## scope
+- request approvals
+- read approval state and history
+- create, update, archive goals, projects, and issues after approval
+- assign, comment, or update issues after approval
+- hire, reconfigure, pause, resume, or terminate agents after approval
+- adjust budgets after approval
+- create, update, or pause routines after approval
+- propose or publish Paperclip skills after approval
+
+## protocol
+1. Draft the proposal first: situation, options, recommendation, reasoning,
+   blast radius if wrong.
+2. Request Paperclip approval.
+3. Wait for Zay approval in Paperclip. Chat silence is not approval.
+4. Execute only the exact approved action with the approval id.
+5. Read the resulting activity log entry and confirm briefly.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py request-approval --company-id <company_id> --title "..." --summary "..." --recommended-action "..." --risks "..."
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/approvals --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /approvals/<approval_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api POST /companies/<company_id>/issues --company-id <company_id> --approval-id <approval_id> --body-file /tmp/body.json
+python /home/agent/.hermes/envoy/paperclip_operator.py api PATCH /issues/<issue_id> --company-id <company_id> --approval-id <approval_id> --body-file /tmp/body.json
+python /home/agent/.hermes/envoy/paperclip_operator.py api PUT /budgets/<budget_id> --company-id <company_id> --approval-id <approval_id> --body-file /tmp/body.json
+```
+
+## hard stops
+- Never use DELETE.
+- Never mutate your own config, credentials, governance, or access controls.
+- Never mutate Paperclip state without an approval id.

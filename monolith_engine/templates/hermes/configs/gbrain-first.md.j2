@@ -1,0 +1,83 @@
+---
+name: gbrain-first
+description: For Raava-internal questions, query the company brain via `gbrain` before web search or session search. Cite the returned slug.
+version: 1.0.0
+author: Raava Solutions
+license: MIT
+metadata:
+  hermes:
+    tags: [Raava, Brain, Retrieval, Knowledge, Company-Context]
+    related_skills: [gbrain-query, brain-ops]
+---
+
+# gbrain-first
+
+The Raava company brain is on this VM at `/usr/local/bin/gbrain` with credentials already in your environment. It indexes Raava's internal knowledge: company strategy, product decisions, ADRs, theses, lessons learned, agent roles, the operator handbook. **Use it before any external lookup for Raava-internal context.**
+
+## Trigger
+
+For any question whose answer would live in Raava's internal documentation:
+- Company, product, or pricing strategy (Raava Cloud, Monolith, Paperclip, FleetOS tiers)
+- Architectural decisions, ADRs, theses
+- Agent roles, org chart, key contacts, pod structure
+- Operating protocols (Claim-First, Pod-Based Isolation, Truth-in-UI, etc.)
+- Lessons learned, postmortems, incident history
+- "What do we know about X?", "Have we decided Y?", "Who owns Z?"
+
+→ Run gbrain FIRST. Do not jump to web search.
+
+## How to call it
+
+```bash
+gbrain query "<the question>"
+```
+
+The shim returns JSON-RPC results from the hosted brain. Top hits are ranked by hybrid (vector + keyword) score. Each result includes a `slug` (the path to the source page in the company wiki) and a `score`.
+
+For more precise keyword matching when you know the exact term:
+```bash
+gbrain search "<exact phrase>"
+```
+
+To look up specific pages:
+```bash
+gbrain get <slug>
+gbrain list --type adr     # all ADRs
+gbrain list --tag pricing  # all pricing-tagged pages
+```
+
+## How to respond
+
+1. Quote the top-1 or top-2 hits' `text` field as the source.
+2. **Cite the slug** in your response (e.g. "per `04-Wiki/raava-cloud/target-customer`").
+3. If gbrain's top score is below 0.4 or returns no hits, say so explicitly: *"the company brain doesn't have a clear answer; falling back to..."* — then proceed to web/session search if appropriate.
+4. Never invent Raava-internal facts. If the brain doesn't know, say it doesn't know.
+
+## What gbrain is NOT for
+
+- Public, non-Raava knowledge (current events, third-party docs, public APIs) → web search
+- Real-time fleet state (live VM status, current job runs) → Monolith Fleet API tools
+- Operational state (paperclip task lists, ongoing work) → Paperclip API tools
+
+The brain is for *durable, decided* company knowledge. If the question is about what's happening right now in the fleet, use the live tools.
+
+## Examples
+
+> "What is Raava Cloud's target customer?"
+- Run `gbrain query "Raava Cloud target customer"`.
+- Top hit will point to a wiki page; cite the slug; report the answer.
+
+> "Have we decided how gbrain integrates with Hermes runtimes?"
+- Run `gbrain query "gbrain Hermes runtime integration ADR"`.
+- Expect to hit `05-Decisions/adr-git-canonical-obsidian-ui-gbrain-index-2026-05-18`.
+
+> "What's the latest Linux kernel CVE?"
+- Don't use gbrain. Use web search. (External, non-Raava.)
+
+## When this skill applies
+
+- The user asks a question with company-specific context.
+- Another skill is about to invoke web search and the question topic looks Raava-internal.
+- During session/onboarding queries.
+
+When in doubt: **try gbrain first; it's cheap and either has the answer or doesn't.**

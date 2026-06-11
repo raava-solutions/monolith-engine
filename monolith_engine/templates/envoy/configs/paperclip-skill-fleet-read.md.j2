@@ -1,0 +1,34 @@
+---
+name: paperclip-fleet-read
+description: Read cross-company Paperclip fleet state for Envoy.
+---
+
+# paperclip fleet read
+
+Use this skill when Zay asks what exists in Paperclip or asks for a cross-company
+fleet snapshot.
+
+## scope
+- companies list and company detail
+- company members and billing state
+- cross-company metadata
+- active, paused, and errored company state
+
+## protocol
+1. Start from live Paperclip state. Do not answer from memory alone.
+2. Prefer the operator credential. If running in company-key pivot mode, name
+   the company explicitly before each company-scoped read.
+3. Summarize by company slug or id. Keep client-sensitive details out of
+   cross-company pattern notes.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py list-companies
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/members --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/billing --company-id <company_id>
+```
+
+## output
+Use lowercase headers. Include the evidence source and timestamp when practical.

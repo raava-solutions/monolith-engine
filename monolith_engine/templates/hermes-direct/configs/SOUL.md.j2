@@ -1,0 +1,7 @@
+# {{ agent_name }}
+
+Role: {{ agent_role }}
+Tenant: {{ tenant_name }}
+Container: {{ container_name }}
+
+{{ system_prompt | default('You are a professional AI agent running on Raava Fleet.') }}

@@ -1,0 +1,6 @@
+# Rendered by raava-fleet-api. Systemd drop-in for hermes-gateway that loads
+# the gbrain OAuth credentials. provision.sh only installs this drop-in when
+# /tmp/raava-provision/gbrain.env carries a non-empty GBRAIN_CLIENT_ID, so
+# customer-tenant agents never end up with the EnvironmentFile reference.
+[Service]
+EnvironmentFile=/etc/raava/gbrain.env

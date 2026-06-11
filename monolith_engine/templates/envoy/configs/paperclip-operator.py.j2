@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Envoy Paperclip operator helper.
+
+This script gives Envoy a narrow local tool for Paperclip API access from the
+Hermes terminal tool. It is intentionally Paperclip-only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+READ_METHODS = {"GET", "HEAD"}
+WRITE_METHODS = {"POST", "PATCH", "PUT"}
+FORBIDDEN_METHODS = {"DELETE"}
+
+
+def _env(name: str, default: str = "") -> str:
+    return str(os.environ.get(name) or default).strip()
+
+
+def _api_root() -> str:
+    root = _env("PAPERCLIP_OPERATOR_API_URL") or _env("PAPERCLIP_API_URL")
+    if not root:
+        raise SystemExit("PAPERCLIP_OPERATOR_API_URL is required")
+    return root.rstrip("/")
+
+
+def _load_json_env(name: str, default: Any) -> Any:
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{name} is not valid JSON: {exc}") from exc
+
+
+def _company_keys() -> dict[str, str]:
+    data = _load_json_env("PAPERCLIP_COMPANY_KEYS_JSON", {})
+    if not isinstance(data, dict):
+        raise SystemExit("PAPERCLIP_COMPANY_KEYS_JSON must be a JSON object")
+    return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+
+
+def _company_registry() -> list[dict[str, Any]]:
+    data = _load_json_env("PAPERCLIP_COMPANY_REGISTRY_JSON", [])
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    raise SystemExit("PAPERCLIP_COMPANY_REGISTRY_JSON must be a JSON array")
+
+
+def _api_key(company_id: str | None = None) -> str:
+    operator_key = _env("PAPERCLIP_OPERATOR_API_KEY") or _env("PAPERCLIP_API_KEY")
+    if operator_key:
+        return operator_key
+    keys = _company_keys()
+    if company_id and keys.get(company_id):
+        return keys[company_id]
+    if keys:
+        raise SystemExit("--company-id is required when using company-scoped key pivoting")
+    raise SystemExit("Paperclip credential missing: set PAPERCLIP_OPERATOR_API_KEY or PAPERCLIP_COMPANY_KEYS_JSON")
+
+
+def _headers(company_id: str | None = None) -> dict[str, str]:
+    return {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {_api_key(company_id)}",
+        "x-envoy-operator": "true",
+    }
+
+
+def _url(path: str) -> str:
+    normalized = "/" + path.lstrip("/")
+    return f"{_api_root()}{normalized}"
+
+
+def _body_from_args(args: argparse.Namespace) -> bytes | None:
+    if args.body:
+        try:
+            json.loads(args.body)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--body must be valid JSON: {exc}") from exc
+        return args.body.encode()
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as handle:
+            raw = handle.read()
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--body-file must contain JSON: {exc}") from exc
+        return raw.encode()
+    return None
+
+
+def _validate_method(method: str, approval_id: str | None = None, path: str = "") -> str:
+    method = method.upper()
+    if method in FORBIDDEN_METHODS:
+        raise SystemExit("Envoy is prohibited from DELETE operations")
+    if method in WRITE_METHODS:
+        if path.endswith("/approvals") and method == "POST":
+            return method
+        if not approval_id:
+            raise SystemExit("Paperclip writes require --approval-id for the exact approved action")
+    if method not in READ_METHODS | WRITE_METHODS:
+        raise SystemExit(f"Unsupported method: {method}")
+    return method
+
+
+def request(method: str, path: str, *, company_id: str | None = None, body: bytes | None = None, approval_id: str | None = None) -> Any:
+    method = _validate_method(method, approval_id=approval_id, path=path)
+    headers = _headers(company_id)
+    if approval_id:
+        headers["x-paperclip-approval-id"] = approval_id
+    req = urllib.request.Request(_url(path), data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = response.read()
+            if not payload:
+                return {"status": response.status}
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                return json.loads(payload.decode())
+            return {"status": response.status, "body": payload.decode(errors="replace")}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:1000]
+        raise SystemExit(f"Paperclip {method} {path} returned {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Paperclip request failed: {exc}") from exc
+
+
+def cmd_list_companies(_: argparse.Namespace) -> Any:
+    registry = _company_registry()
+    if registry and not (_env("PAPERCLIP_OPERATOR_API_KEY") or _env("PAPERCLIP_API_KEY")):
+        return registry
+    return request("GET", "/companies")
+
+
+def cmd_api(args: argparse.Namespace) -> Any:
+    return request(
+        args.method,
+        args.path,
+        company_id=args.company_id,
+        body=_body_from_args(args),
+        approval_id=args.approval_id,
+    )
+
+
+def cmd_request_approval(args: argparse.Namespace) -> Any:
+    body = {
+        "type": args.type,
+        "requestedByAgentId": "envoy",
+        "payload": {
+            "title": args.title,
+            "summary": args.summary,
+            "recommendedAction": args.recommended_action,
+            "risks": args.risks or "",
+        },
+    }
+    return request(
+        "POST",
+        f"/companies/{urllib.parse.quote(args.company_id)}/approvals",
+        company_id=args.company_id,
+        body=json.dumps(body).encode(),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Envoy Paperclip operator helper")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    list_companies = sub.add_parser("list-companies")
+    list_companies.set_defaults(func=cmd_list_companies)
+
+    api = sub.add_parser("api")
+    api.add_argument("method")
+    api.add_argument("path")
+    api.add_argument("--company-id")
+    api.add_argument("--approval-id")
+    api.add_argument("--body")
+    api.add_argument("--body-file")
+    api.set_defaults(func=cmd_api)
+
+    approval = sub.add_parser("request-approval")
+    approval.add_argument("--company-id", required=True)
+    approval.add_argument("--title", required=True)
+    approval.add_argument("--summary", required=True)
+    approval.add_argument("--recommended-action", required=True)
+    approval.add_argument("--risks")
+    approval.add_argument("--type", default="request_board_approval")
+    approval.set_defaults(func=cmd_request_approval)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    result = args.func(args)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

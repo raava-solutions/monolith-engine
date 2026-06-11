@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.23",
+    "lastTouchedAt": "{{ now | default('2026-03-25T00:00:00Z') }}"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+{% if model_provider in ('ollama', 'endpoint') %}
+      "local": {
+        "baseUrl": "{{ model_base_url | default('http://host.docker.internal:11434/v1') }}",
+        "apiKey": "local",
+{% else %}
+      "openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "${OPENROUTER_API_KEY}",
+{% endif %}
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "{{ model }}",
+            "name": "{{ model }}",
+            "reasoning": true,
+            "input": ["text"],
+            "contextWindow": 131072,
+            "maxTokens": 32768
+          }
+        ]
+      }
+    }
+  },
+  "update": {
+    "channel": "stable",
+    "auto": { "enabled": false }
+  },
+  "gateway": {
+    "mode": "local",
+    "port": {{ gateway_port | default('18789') }}
+  }
+}

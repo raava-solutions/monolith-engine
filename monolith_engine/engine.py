@@ -18,13 +18,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from monolith_engine.chat.hermes import agent_chat
 from monolith_engine.chat.oneshot import chat_oneshot
+from monolith_engine.connections_registry import get_connector, known_connector_types
 from monolith_engine.ports.provider import ComputeProvider
 from monolith_engine.storage.interface import (
     LOCAL_TENANT,
     ContainerRecord,
     StorageBackend,
 )
+from monolith_engine.workflows import fsm
+from monolith_engine.workflows.runner import make_step_runner
+from monolith_engine.workflows.schema import parse_workflow_toml
 
 
 @dataclass
@@ -64,12 +69,156 @@ class Engine:
         await self.storage.write_audit(container_id, "provision", f"image={image} role={role}")
         return record
 
-    async def chat(self, container_id: str, message: str, *, timeout: int = 60) -> str:
-        """Resolve a tenant-scoped container, then one-shot the message into it."""
+    async def chat(self, container_id: str, message: str, *, timeout: int = 120) -> str:
+        """Resolve a tenant-scoped container, then dispatch to its agent runtime.
+
+        Falls back to a raw shell one-shot when no agent runtime is present
+        (containers provisioned without an agent — the Ring 0 proof shape).
+        """
         record = await self.storage.get_container(container_id, tenant_id=self.tenant_id)
         if record is None or record.status == "deleted":
             raise LookupError(f"container '{container_id}' not found")
-        return await chat_oneshot(self.provider, record.id, message, timeout=timeout)
+        if record.metadata.get("runtime") == "none" or not record.metadata.get("runtime"):
+            try:
+                return await agent_chat(self.provider, record.id, message, timeout=timeout)
+            except RuntimeError as exc:
+                if "runtime_not_running" not in str(exc):
+                    raise
+                return await chat_oneshot(self.provider, record.id, message, timeout=timeout)
+        return await agent_chat(self.provider, record.id, message, timeout=timeout)
+
+    # ── Workflows ────────────────────────────────────────────────────────────
+
+    async def workflow_apply(self, body: str) -> dict:
+        """Validate and version a TOML workflow definition (idempotent)."""
+        spec = parse_workflow_toml(body)
+        result = await self.storage.apply_workflow(
+            tenant_id=self.tenant_id, name=spec.name, body=body, concurrency=spec.concurrency
+        )
+        await self.storage.write_audit(None, "workflow:apply", f"name={spec.name} v={result['version']}")
+        return {"name": spec.name, **result}
+
+    async def workflow_list(self) -> list[dict]:
+        rows = await self.storage.list_workflows(self.tenant_id)
+        return [
+            {
+                "name": r["name"],
+                "concurrency": r["concurrency"],
+                "enabled": bool(r["enabled"]),
+                "current_version_id": r["current_version_id"],
+            }
+            for r in rows
+        ]
+
+    async def workflow_get(self, name: str) -> dict | None:
+        wf = await self.storage.get_workflow(self.tenant_id, name)
+        if wf is None:
+            return None
+        version = (
+            await self.storage.get_workflow_version(wf["current_version_id"])
+            if wf["current_version_id"] else None
+        )
+        return {
+            "name": wf["name"],
+            "concurrency": wf["concurrency"],
+            "enabled": bool(wf["enabled"]),
+            "version": version["version"] if version else None,
+            "content_hash": version["content_hash"] if version else None,
+            "body": version["body"] if version else None,
+        }
+
+    async def workflow_run(self, name: str) -> dict:
+        """Dispatch and drive a run of the workflow's current version."""
+        wf = await self.storage.get_workflow(self.tenant_id, name)
+        if wf is None:
+            raise LookupError(f"workflow '{name}' not found")
+        if not wf["current_version_id"]:
+            raise ValueError("workflow has no applied version")
+        version = await self.storage.get_workflow_version(wf["current_version_id"])
+        spec = parse_workflow_toml(version["body"])
+        run = await fsm.dispatch_run(
+            self.storage,
+            tenant_id=self.tenant_id,
+            workflow_id=wf["id"],
+            version_id=version["id"],
+            spec=spec,
+        )
+        await self.storage.mark_run_running(run["id"])
+        runner = make_step_runner(self.storage, self.provider)
+        final = await fsm.execute_run(self.storage, run["id"], spec, runner)
+        await self.storage.write_audit(None, "workflow:run", f"name={name} run={run['id']} status={final}")
+        return {"run_id": run["id"], "status": final}
+
+    async def workflow_run_status(self, run_id: str) -> dict | None:
+        run = await self.storage.get_run_for_tenant(self.tenant_id, run_id)
+        if run is None:
+            return None
+        steps = await self.storage.list_steps(run_id)
+        import json as _json
+
+        def _result(raw):
+            if not raw:
+                return None
+            try:
+                parsed = _json.loads(raw) if isinstance(raw, str) else raw
+            except (ValueError, TypeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+
+        return {
+            "run_id": run["id"],
+            "workflow_id": run["workflow_id"],
+            "status": run["status"],
+            "current_step": run["current_step"],
+            "error": run["error"],
+            "steps": [
+                {
+                    "index": s["step_index"],
+                    "name": s["name"],
+                    "type": s["type"],
+                    "status": s["status"],
+                    "attempt": s["attempt"],
+                    "error": s["error"],
+                    "result": _result(s.get("result")),
+                }
+                for s in steps
+            ],
+        }
+
+    # ── Connections ──────────────────────────────────────────────────────────
+
+    async def connection_add(self, name: str, connector_type: str, config: dict) -> dict:
+        connector = get_connector(connector_type)
+        connector.validate_config(config)
+        row = await self.storage.upsert_connection(
+            tenant_id=self.tenant_id, name=name, connector_type=connector_type, config=config
+        )
+        await self.storage.write_audit(None, "connection:create", f"name={name} type={connector_type}")
+        return {"name": row["name"], "type": row["connector_type"], "status": row["status"]}
+
+    async def connection_list(self) -> dict:
+        rows = await self.storage.list_connections(self.tenant_id)
+        return {
+            "connectors_available": known_connector_types(),
+            "connections": [
+                {"name": r["name"], "type": r["connector_type"], "status": r["status"]}
+                for r in rows
+            ],
+        }
+
+    async def connection_get(self, name: str) -> dict | None:
+        import json as _json
+
+        row = await self.storage.get_connection(self.tenant_id, name)
+        if row is None:
+            return None
+        cfg = row["config"]
+        return {
+            "name": row["name"],
+            "type": row["connector_type"],
+            "status": row["status"],
+            "config": _json.loads(cfg) if isinstance(cfg, str) else cfg,
+        }
 
     async def status(self) -> list[ContainerRecord]:
         """List the tenant's live containers."""

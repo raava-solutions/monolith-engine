@@ -1,0 +1,48 @@
+[Unit]
+Description=Hermes Gateway — {{ agent_name }}
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/home/agent/hermes-agent
+Environment=HOME=/home/agent
+Environment=HERMES_HOME=/home/agent/.hermes
+Environment=PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MONOLITH_RUNTIME_ENVELOPE={{ runtime_envelope | default("hermes_alpha") }}
+Environment=MONOLITH_RUNTIME_CONTRACT_VERSION={{ runtime_contract_version | default("1") }}
+Environment=MONOLITH_HERMES_HOME={{ hermes_home | default("/home/agent/.hermes") }}
+Environment=MONOLITH_GATEWAY_SERVICE={{ runtime_gateway_service | default("hermes-gateway") }}
+Environment=HERMES_CAMEL_GUARD_MODE={{ camel_guard_effective_mode | default("off") }}
+Environment=MONOLITH_CAMEL_GUARD_REQUESTED_MODE={{ camel_guard_requested_mode | default(camel_guard_mode | default("off")) }}
+Environment=MONOLITH_CAMEL_GUARD_ENFORCEMENT_ENABLED={{ "true" if camel_guard_enforcement_enabled is defined and camel_guard_enforcement_enabled else "false" }}
+{% if trace_enabled is defined and trace_enabled %}
+# Non-secret trace context is repeated here so it is present even when no EnvironmentFile is loaded.
+Environment=MONOLITH_TRACE_ENABLED=true
+Environment=MONOLITH_TRACE_TENANT_ID={{ tenant_id }}
+Environment=MONOLITH_TRACE_AGENT_NAME={{ agent_slug }}
+Environment=MONOLITH_TRACE_CONTAINER_ID={{ container_name }}
+Environment=OTEL_SERVICE_NAME={{ otel_service_name | default(container_name) }}
+{% if otel_exporter_otlp_endpoint is defined and otel_exporter_otlp_endpoint %}
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT={{ otel_exporter_otlp_endpoint }}
+{% endif %}
+Environment=OTEL_RESOURCE_ATTRIBUTES={{ otel_resource_attributes | default('tenant_id=' ~ tenant_id ~ ',agent_name=' ~ agent_slug ~ ',container_id=' ~ container_name) }}
+{% endif %}
+{% if secrets_mode == 'env' %}
+EnvironmentFile=/etc/hermes/{{ agent_slug }}.env
+ExecStartPre=/usr/bin/test -d {{ hermes_home | default("/home/agent/.hermes") }}
+ExecStartPre=/usr/bin/test -f {{ hermes_home | default("/home/agent/.hermes") }}/config.yaml
+ExecStart=/home/agent/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+{% else %}
+ExecStartPre=/usr/bin/test -d {{ hermes_home | default("/home/agent/.hermes") }}
+ExecStartPre=/usr/bin/test -f {{ hermes_home | default("/home/agent/.hermes") }}/config.yaml
+ExecStart=/home/agent/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+{% endif %}
+Restart=on-failure
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target

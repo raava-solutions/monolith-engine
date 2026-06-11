@@ -1,0 +1,47 @@
+model:
+  provider: {{ 'custom' if model_provider in ('ollama', 'endpoint') else (model_provider | default('openrouter')) }}
+  default: {{ model }}
+{% if model_provider in ('ollama', 'endpoint') %}
+  base_url: {{ model_base_url | default('http://host.docker.internal:11434/v1') }}
+{% else %}
+  base_url: {{ bridge_llm_base_url if (bridge_mode is defined and bridge_mode) else 'https://openrouter.ai/api/v1' }}
+{% endif %}
+toolsets:
+- hermes-cli
+agent:
+  max_turns: 90
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+browser:
+  inactivity_timeout: 120
+  record_sessions: false
+checkpoints:
+  enabled: false
+compression:
+  enabled: true
+  threshold: 0.5
+  summary_model: google/gemini-3-flash-preview
+  summary_provider: auto
+display:
+  compact: false
+  personality: {{ personality | default('professional') }}
+  resume_display: full
+  bell_on_complete: false
+  show_reasoning: false
+  skin: default
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+timezone: {{ timezone | default('America/New_York') }}
+{% if discord_channel is defined and discord_channel %}
+discord:
+  require_mention: true
+{% endif %}
+security:
+  redact_secrets: true
+  tirith_enabled: true
+_config_version: 8

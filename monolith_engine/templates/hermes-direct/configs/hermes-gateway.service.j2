@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes Gateway — {{ agent_name }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/home/agent/hermes-agent
+Environment=HOME=/home/agent
+Environment=HERMES_HOME=/home/agent/.hermes
+Environment=PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/hermes/{{ agent_slug }}.env
+ExecStart=/home/agent/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

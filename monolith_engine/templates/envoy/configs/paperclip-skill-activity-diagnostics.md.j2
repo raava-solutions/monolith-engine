@@ -1,0 +1,35 @@
+---
+name: paperclip-activity-diagnostics
+description: Diagnose Paperclip stalls from activity logs, traces, heartbeats, and work products.
+---
+
+# paperclip activity diagnostics
+
+Use this skill when something looks stuck or Zay asks why something happened.
+
+## scope
+- activity log reads
+- agent heartbeats
+- tool-call traces
+- costs and failed tool-call clusters
+- recent work products and issue state
+
+## protocol
+1. Pull activity log and current issue or agent state.
+2. Compare symptoms against goals, projects, budgets, and recent work products.
+3. Produce root cause, evidence, confidence, and recommendation.
+4. If the cause is below the Paperclip line, draft a Linear ticket for Argus
+   instead of acting.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/activity --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/status --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/traces --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /agents/<agent_id>/costs --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /issues/<issue_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /issues/<issue_id>/documents --company-id <company_id>
+```
+
+## output
+Use: issue, evidence, diagnosis, recommendation, approval needed, Argus needed.

@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenClaw Gateway — {{ agent_name }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/home/agent
+Environment=HOME=/home/agent
+Environment=OPENCLAW_CONFIG_DIR=/home/agent/.openclaw
+Environment=OPENCLAW_WORKSPACE_DIR=/home/agent/.openclaw/workspace
+Environment=PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+{% if op_token %}
+Environment=OP_SERVICE_ACCOUNT_TOKEN={{ op_token }}
+{% endif %}
+ExecStart=/usr/bin/op run --env-file=/etc/openclaw/{{ agent_slug }}.env.tpl -- env HOME=/home/agent OPENCLAW_CONFIG_DIR=/home/agent/.openclaw OPENCLAW_WORKSPACE_DIR=/home/agent/.openclaw/workspace openclaw gateway --port {{ gateway_port | default('18789') }}
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60s
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

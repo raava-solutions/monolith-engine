@@ -1,0 +1,240 @@
+name: hermes
+display_name: Hermes Agent
+description: 'AI agent by Nous Research with 90+ tools, persistent memory, and multi-platform support'
+version: '0.9.4'
+visibility: public
+base_image: raava-hermes-golden
+service_name: hermes-gateway
+
+defaults:
+  memory: '4GB'
+  cpu: '2'
+  disk: '30GB'
+  model_provider: openrouter
+  model: 'minimax/minimax-m2.5'
+  timezone: 'America/New_York'
+  personality: 'professional'
+
+fields:
+  - name: model
+    type: string
+    required: true
+    description: 'LLM model ID on OpenRouter (e.g. minimax/minimax-m2.5, google/gemini-3-flash-preview)'
+  - name: model_provider
+    type: string
+    required: false
+    default: openrouter
+    description: 'Model provider: openrouter, moonshot, minimax, ollama, endpoint (local OpenAI-compatible)'
+  - name: model_base_url
+    type: string
+    required: false
+    description: 'OpenAI-compatible base URL for local model providers (ollama, endpoint), e.g. http://host.docker.internal:11434/v1. No cloud provider key is required for these providers.'
+  - name: system_prompt
+    type: text
+    required: false
+    description: 'Custom SOUL.md content. Uses a default professional template if omitted.'
+  - name: timezone
+    type: string
+    required: false
+    default: 'America/New_York'
+  - name: aurum_steering_enabled
+    type: boolean
+    required: false
+    default: false
+    description: 'Enable the staging Aurum pre-LLM steering plugin for datetime and task-specific context injection'
+  - name: aurum_steering_timezone
+    type: string
+    required: false
+    default: 'America/New_York'
+    description: 'Timezone used by the Aurum steering plugin for local temporal awareness'
+  - name: aurum_steering_profile
+    type: string
+    required: false
+    default: 'aurum-trader-chief-of-staff'
+    description: 'Aurum steering profile name included in injected context'
+  - name: gbrain_enabled
+    type: boolean
+    required: false
+    default: false
+    description: 'Wire gbrain CLI shim + per-agent OAuth client for Raava company-brain access. Auto-enabled for tenant_id=raava agents in provisioner; never for customer-tenant agents.'
+  - name: personality
+    type: string
+    required: false
+    default: professional
+    description: 'Agent personality style: professional, kawaii, concise'
+  - name: discord_channel
+    type: string
+    required: false
+    description: 'Discord home channel ID for this agent'
+  - name: secrets_mode
+    type: string
+    required: false
+    default: 'env'
+    enum: [env, none]
+    description: 'How secrets are injected: env resolves GCP Secret Manager values at provision time into a root-only runtime env file'
+  - name: hermes_ref
+    type: string
+    required: false
+    default: 'latest'
+    description: 'Git ref (branch/tag/commit) to clone for hermes-agent'
+  - name: install_extras
+    type: string
+    required: false
+    default: 'messaging'
+    description: 'pip extras to install (e.g. messaging, all)'
+  - name: runtime_envelope
+    type: string
+    required: false
+    default: hermes_alpha
+    enum: [hermes_alpha]
+    description: 'Monolith runtime envelope contract for hosted Hermes operations'
+  - name: hermes_home
+    type: string
+    required: false
+    default: '/home/agent/.hermes'
+    description: 'Persistent Hermes home directory expected by diagnostics and GCP state disk mounting'
+  - name: runtime_gateway_service
+    type: string
+    required: false
+    default: hermes-gateway
+    description: 'systemd unit that owns the Hermes messaging gateway lifecycle'
+  - name: runtime_persistent_paths
+    type: string
+    required: false
+    default: '/home/agent/.hermes,/home/agent/.config/hermes,/home/agent/workspace'
+    description: 'Comma-separated paths that must survive VM recreate/restore on stateful providers'
+  - name: runtime_sidecar_services
+    type: string
+    required: false
+    default: ''
+    description: 'Comma-separated optional sidecar systemd units expected for this runtime'
+  - name: hud_enabled
+    type: boolean
+    required: false
+    default: true
+    description: 'Enable the Monolith headless HUD collector for per-agent fleet telemetry'
+  - name: hud_ingest_url
+    type: string
+    required: false
+    description: 'Fleet API base URL used by the HUD collector to ingest snapshots'
+  - name: hud_ingest_api_key
+    type: string
+    required: false
+    description: 'Optional explicit HUD ingest API key; normally resolved through the observability integration'
+  - name: hud_sample_interval_seconds
+    type: integer
+    required: false
+    default: 60
+    description: 'Systemd timer interval for redacted HUD snapshot collection'
+  - name: runtime_health_command
+    type: string
+    required: false
+    default: 'systemctl is-active --quiet hermes-gateway && test -d /home/agent/.hermes'
+    description: 'Read-only shell health command used by runtime diagnostics and smoke checks'
+  - name: camel_guard_mode
+    type: string
+    required: false
+    default: 'off'
+    enum: ['off', 'monitor', 'enforce']
+    description: 'CaMeL-style trust-boundary policy mode; enforce is downgraded to monitor until a future rollout enables blocking'
+  - name: trace_enabled
+    type: boolean
+    required: false
+    default: false
+    description: 'Enable Monolith observability wiring for this agent runtime'
+  - name: observability_proxy_url
+    type: string
+    required: false
+    description: 'OpenAI-compatible base URL for the trace-aware OpenRouter proxy'
+  - name: trace_ingest_url
+    type: string
+    required: false
+    description: 'Fleet API trace ingest URL used by the gateway/proxy'
+  - name: otel_exporter_otlp_endpoint
+    type: string
+    required: false
+    description: 'OTLP collector endpoint for agent runtime telemetry'
+
+secret_slots:
+  - env_var: OPENROUTER_API_KEY
+    required: true
+    description: 'API key for the model provider'
+  - env_var: DISCORD_BOT_TOKEN
+    required: false
+    integration: discord
+  - env_var: TELEGRAM_BOT_TOKEN
+    required: false
+    integration: telegram
+  - env_var: SLACK_BOT_TOKEN
+    required: false
+    integration: slack
+  - env_var: SLACK_APP_TOKEN
+    required: false
+    integration: slack
+  - env_var: BRAVE_SEARCH_API_KEY
+    required: false
+    integration: web_search
+  - env_var: EXA_API_KEY
+    required: false
+    integration: web_search
+  - env_var: PARALLEL_API_KEY
+    required: false
+    integration: web_search
+  - env_var: FIRECRAWL_API_KEY
+    required: false
+    integration: web_search
+  - env_var: MONOLITH_TRACE_INGEST_API_KEY
+    required: false
+    integration: observability
+  - env_var: MONOLITH_HUD_INGEST_API_KEY
+    required: false
+    integration: observability
+
+integrations:
+  - name: observability
+    description: 'Monolith trace ingest and OpenTelemetry export wiring'
+    secrets:
+      - key: MONOLITH_TRACE_INGEST_API_KEY
+        op_ref: 'op://{vault}/Monolith Trace Ingest API Key/credential'
+      - key: MONOLITH_HUD_INGEST_API_KEY
+        op_ref: 'op://{vault}/Monolith HUD Ingest API Key/credential'
+  - name: discord
+    description: 'Discord messaging integration'
+    secrets:
+      - key: DISCORD_BOT_TOKEN
+        op_ref: 'op://{vault}/Discord Bot Token/credential'
+  - name: telegram
+    description: 'Telegram bot integration'
+    secrets:
+      - key: TELEGRAM_BOT_TOKEN
+        op_ref: 'op://{vault}/Telegram Bot Token/credential'
+  - name: slack
+    description: 'Slack messaging integration'
+    secrets:
+      - key: SLACK_BOT_TOKEN
+        op_ref: 'op://{vault}/Slack Bot Token/credential'
+      - key: SLACK_APP_TOKEN
+        op_ref: 'op://{vault}/Slack App Token/credential'
+  - name: web_search
+    description: 'Web search capability for Brave, Exa, Parallel, and Firecrawl'
+    secrets:
+      - key: BRAVE_SEARCH_API_KEY
+        op_ref: 'op://{vault}/Brave Search API Key/credential'
+      - key: EXA_API_KEY
+        op_ref: 'op://{vault}/Exa API Key/credential'
+      - key: PARALLEL_API_KEY
+        op_ref: 'op://{vault}/Parallel API Key/credential'
+      - key: FIRECRAWL_API_KEY
+        op_ref: 'op://{vault}/Firecrawl API Key/credential'
+
+health_check: "pgrep -f 'hermes_cli.main gateway'"
+
+providers:
+  lxd:
+    image: raava-hermes-golden
+  docker:
+    image: monolith-hermes-golden:latest
+  gce:
+    machine_image: raava-base-hermes
+    machine_type: e2-small
+    disk_size_gb: 50

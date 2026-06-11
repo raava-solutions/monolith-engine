@@ -1,0 +1,33 @@
+---
+name: paperclip-routines-skills
+description: Inspect and propose Paperclip routines and skills.
+---
+
+# paperclip routines skills
+
+Use this skill for scheduled work, recurring checks, reusable Paperclip skills,
+and skill consolidation proposals.
+
+## scope
+- routines list and detail
+- routine triggers and runs
+- Paperclip skills list, content, and version history
+- shared skill promotion proposals
+
+## protocol
+1. Read local company routine or skill state first.
+2. Compare against similar companies only at the pattern level unless Zay asks
+   for direct cross-company detail.
+3. Draft consolidation as a proposal. Publishing or updating skills is Tier 3.
+
+## commands
+```sh
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/routines --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /routines/<routine_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /companies/<company_id>/skills --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /skills/<skill_id> --company-id <company_id>
+python /home/agent/.hermes/envoy/paperclip_operator.py api GET /skills/<skill_id>/versions --company-id <company_id>
+```
+
+## output
+State whether this is a company-local recommendation or cross-company pattern.
