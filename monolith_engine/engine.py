@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from monolith_engine.chat.hermes import agent_chat
-from monolith_engine.chat.oneshot import chat_oneshot
 from monolith_engine.connections_registry import get_connector, known_connector_types
 from monolith_engine.ports.provider import ComputeProvider
 from monolith_engine.storage.interface import (
@@ -48,7 +47,12 @@ class Engine:
         memory_mb: int = 512,
         disk_gb: int = 10,
     ) -> ContainerRecord:
-        """Create a container via the provider and persist it via storage."""
+        """Create a tracked container via the provider and persist it (LOW-LEVEL).
+
+        The product path is template-based provisioning (every container is
+        agent-backed); this primitive creates a bare tracked container and is
+        used internally/in tests, never exposed as a user-facing provision.
+        """
         container_id = name or f"agent-{uuid.uuid4().hex[:10]}"
         await self.provider.create(
             container_id, image, vcpus, memory_mb, disk_gb,
@@ -78,13 +82,8 @@ class Engine:
         record = await self.storage.get_container(container_id, tenant_id=self.tenant_id)
         if record is None or record.status == "deleted":
             raise LookupError(f"container '{container_id}' not found")
-        if record.metadata.get("runtime") == "none" or not record.metadata.get("runtime"):
-            try:
-                return await agent_chat(self.provider, record.id, message, timeout=timeout)
-            except RuntimeError as exc:
-                if "runtime_not_running" not in str(exc):
-                    raise
-                return await chat_oneshot(self.provider, record.id, message, timeout=timeout)
+        # Every container is agent-backed (provisioned from a template), so chat
+        # always dispatches to the agent runtime — there is no bare-container path.
         return await agent_chat(self.provider, record.id, message, timeout=timeout)
 
     # ── Workflows ────────────────────────────────────────────────────────────
