@@ -96,6 +96,9 @@ fi
 
 echo "[raava] Installing configs..."
 mkdir -p /home/agent/.hermes
+# The dir is created as root; the gateway runs as agent and must be able to
+# create runtime subdirs (logs/, sessions/, …) — own the whole tree to agent.
+chown -R agent:agent /home/agent/.hermes
 
 cp /tmp/raava-provision/config.yaml /home/agent/.hermes/config.yaml
 chown agent:agent /home/agent/.hermes/config.yaml
