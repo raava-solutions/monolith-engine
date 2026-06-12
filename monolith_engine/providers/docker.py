@@ -11,7 +11,6 @@ Genuinely unsupported operations (runtime ``set_config``) raise
 """
 
 import asyncio
-import base64
 import logging
 import shlex
 from datetime import UTC, datetime
@@ -39,17 +38,18 @@ def _map_docker_status(raw: str) -> str:
 
 
 async def _run(
-    args: list[str], timeout: int = 30
+    args: list[str], timeout: int = 30, input_bytes: bytes | None = None
 ) -> tuple[str, str, int]:
     """Run a subprocess command, return (stdout, stderr, returncode)."""
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.PIPE if input_bytes is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=float(timeout)
+            proc.communicate(input=input_bytes), timeout=float(timeout)
         )
     except TimeoutError:
         proc.kill()
@@ -208,12 +208,21 @@ class DockerProvider(ComputeProvider):
     # ------------------------------------------------------------------
 
     async def exec_command(
-        self, name: str, command: list[str], timeout: int = 30
+        self,
+        name: str,
+        command: list[str],
+        timeout: int = 30,
+        input_bytes: bytes | None = None,
     ) -> ExecResult:
         cmd_str = " ".join(shlex.quote(c) for c in command)
+        docker_cmd = [self.docker_bin, "exec"]
+        if input_bytes is not None:
+            docker_cmd.append("-i")
+        docker_cmd.extend([name, "sh", "-c", cmd_str])
         stdout, stderr, rc = await _run(
-            [self.docker_bin, "exec", name, "sh", "-c", cmd_str],
+            docker_cmd,
             timeout=timeout,
+            input_bytes=input_bytes,
         )
         return ExecResult(stdout=stdout, stderr=stderr, exit_code=rc)
 
@@ -240,12 +249,14 @@ class DockerProvider(ComputeProvider):
         return result.stdout.encode()
 
     async def write_file(self, name: str, path: str, content: bytes) -> None:
-        b64 = base64.b64encode(content).decode()
         quoted_path = shlex.quote(path)
-        await self.exec_command(
+        result = await self.exec_command(
             name,
-            ["bash", "-c", f"echo '{b64}' | base64 -d > {quoted_path}"],
+            ["sh", "-c", f"cat > {quoted_path}"],
+            input_bytes=content,
         )
+        if result.exit_code != 0:
+            raise RuntimeError(f"writing {path} failed: {result.stderr}")
 
     async def push_file(self, local_path: str, name: str, remote_path: str) -> None:
         _, stderr, rc = await _run(

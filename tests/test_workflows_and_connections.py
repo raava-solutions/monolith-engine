@@ -66,7 +66,7 @@ async def test_run_executes_real_steps_and_persists_results(engine):
         ExecResult("done\n", "", 0),        # summarize agent dispatch
     ]
 
-    async def exec_command(name, command, timeout=30):
+    async def exec_command(name, command, timeout=30, input_bytes=None):
         i = min(calls["n"], len(results) - 1)
         calls["n"] += 1
         return results[i]

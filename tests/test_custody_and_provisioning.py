@@ -67,7 +67,7 @@ class DockerProvider:
         self.containers[name] = {"image": image, "status": "running", "ip": "172.17.0.2"}
         return "container-id"
 
-    async def exec_command(self, name, command, timeout=30):
+    async def exec_command(self, name, command, timeout=30, input_bytes=None):
         from monolith_engine.ports.provider import ExecResult
 
         self.exec_calls.append(command)

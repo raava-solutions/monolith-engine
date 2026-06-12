@@ -11,7 +11,6 @@ GSM/multi-tenant resolution on top of this same core.
 
 from __future__ import annotations
 
-import base64
 import os
 import shlex
 from dataclasses import dataclass
@@ -240,11 +239,12 @@ async def _stage_local_paths(provider: ComputeProvider, container: str, template
 
 
 async def _push_text(provider: ComputeProvider, container: str, content: str, remote_path: str) -> None:
-    # base64 through exec — works on every provider without host temp files.
-    b64 = base64.b64encode(content.encode()).decode()
     quoted = shlex.quote(remote_path)
     result = await provider.exec_command(
-        container, ["sh", "-c", f"echo '{b64}' | base64 -d > {quoted}"], timeout=60
+        container,
+        ["sh", "-c", f"cat > {quoted}"],
+        timeout=60,
+        input_bytes=content.encode(),
     )
     if result.exit_code != 0:
         raise ProvisionError("push", f"writing {remote_path} failed: {result.stderr.strip()}")
