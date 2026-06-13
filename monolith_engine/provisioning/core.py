@@ -72,8 +72,10 @@ class TemplateSpec:
 
 
 def load_template(name: str) -> TemplateSpec:
-    requested = Path(name)
-    if requested.name != name:
+    # Template names must be a single, literal path component. Reject separators,
+    # empty/relative names, and anything Path would split, so a user template dir
+    # can never be coaxed into resolving outside its own root.
+    if "/" in name or "\\" in name or name in ("", ".", "..") or Path(name).parts != (name,):
         raise ProvisionError("template", f"template '{name}' not found")
     for root in template_dirs():
         path = root / name / "template.yaml"
