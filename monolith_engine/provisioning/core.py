@@ -12,8 +12,9 @@ GSM/multi-tenant resolution on top of this same core.
 from __future__ import annotations
 
 import base64
+import os
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from monolith_engine.ports.provider import ComputeProvider
 # Local model providers need a base URL, not a cloud key.
 LOCAL_MODEL_PROVIDERS = {"ollama", "endpoint"}
 DEFAULT_OLLAMA_BASE_URL = "http://host.docker.internal:11434/v1"
+DEFAULT_USER_TEMPLATE_DIR = Path("~/.config/monolith/templates")
 
 
 class ProvisionError(RuntimeError):
@@ -36,6 +38,16 @@ class ProvisionError(RuntimeError):
 
 def templates_dir() -> Path:
     return Path(str(resources.files("monolith_engine"))) / "templates"
+
+
+def user_templates_dirs() -> list[Path]:
+    configured = os.environ.get("MONOLITH_TEMPLATE_DIR")
+    raw_dirs = configured.split(os.pathsep) if configured else [str(DEFAULT_USER_TEMPLATE_DIR)]
+    return [Path(raw).expanduser() for raw in raw_dirs if raw]
+
+
+def template_dirs() -> list[Path]:
+    return [*user_templates_dirs(), templates_dir()]
 
 
 @dataclass
@@ -60,27 +72,36 @@ class TemplateSpec:
 
 
 def load_template(name: str) -> TemplateSpec:
-    path = templates_dir() / name / "template.yaml"
-    if not path.is_file():
+    requested = Path(name)
+    if requested.name != name:
         raise ProvisionError("template", f"template '{name}' not found")
-    return TemplateSpec(name=name, raw=yaml.safe_load(path.read_text()) or {}, path=path.parent)
+    for root in template_dirs():
+        path = root / name / "template.yaml"
+        if path.is_file():
+            return TemplateSpec(name=name, raw=yaml.safe_load(path.read_text()) or {}, path=path.parent)
+    raise ProvisionError("template", f"template '{name}' not found")
 
 
 def list_templates() -> list[dict]:
     out = []
-    for tdir in sorted(templates_dir().iterdir()):
-        ty = tdir / "template.yaml"
-        if not ty.is_file():
+    seen = set()
+    for root in template_dirs():
+        if not root.is_dir():
             continue
-        raw = yaml.safe_load(ty.read_text()) or {}
-        out.append(
-            {
-                "name": raw.get("name", tdir.name),
-                "display_name": raw.get("display_name", tdir.name),
-                "description": raw.get("description", ""),
-                "visibility": raw.get("visibility", "public"),
-            }
-        )
+        for tdir in sorted(root.iterdir()):
+            ty = tdir / "template.yaml"
+            if not ty.is_file() or tdir.name in seen:
+                continue
+            raw = yaml.safe_load(ty.read_text()) or {}
+            seen.add(tdir.name)
+            out.append(
+                {
+                    "name": raw.get("name", tdir.name),
+                    "display_name": raw.get("display_name", tdir.name),
+                    "description": raw.get("description", ""),
+                    "visibility": raw.get("visibility", "public"),
+                }
+            )
     return out
 
 
@@ -107,15 +128,19 @@ def render_configs(template: TemplateSpec, context: dict) -> dict[str, str]:
 
 def build_context(template: TemplateSpec, *, agent_name: str, role: str, model: str | None,
                   model_provider: str | None, model_base_url: str | None,
-                  gateway_port: str | None = None, secrets: dict[str, str] | None = None) -> dict:
+                  gateway_port: str | None = None, secrets: dict[str, str] | None = None,
+                  trace_enabled: bool = False, tenant_id: str = "local") -> dict:
     defaults = template.defaults
     provider = (model_provider or defaults.get("model_provider") or "openrouter").strip().lower()
     base_url = model_base_url or (
         DEFAULT_OLLAMA_BASE_URL if provider == "ollama" else defaults.get("model_base_url")
     )
+    secret_values = {k: v for k, v in (secrets or {}).items() if v}
+    container_name = agent_name
     ctx = {
         "agent_name": agent_name,
         "agent_slug": agent_name,
+        "container_name": container_name,
         "agent_role": role,
         "model": model or defaults.get("model", ""),
         "model_provider": provider,
@@ -124,8 +149,17 @@ def build_context(template: TemplateSpec, *, agent_name: str, role: str, model: 
         "personality": defaults.get("personality", "professional"),
         "secrets_mode": "env",
         "gateway_port": gateway_port or defaults.get("gateway_port", "18789"),
+        "trace_enabled": trace_enabled,
+        "tenant_id": tenant_id,
+        "otel_service_name": defaults.get("otel_service_name", container_name),
+        "otel_exporter_otlp_endpoint": defaults.get("otel_exporter_otlp_endpoint"),
+        "otel_resource_attributes": defaults.get(
+            "otel_resource_attributes",
+            f"tenant_id={tenant_id},agent_name={agent_name},container_id={container_name}",
+        ),
+        "secrets_dict": secret_values,
         "secrets": [
-            {"env_var": k, "value": v} for k, v in (secrets or {}).items() if v
+            {"env_var": k, "value": v} for k, v in secret_values.items()
         ],
     }
     return ctx

@@ -208,7 +208,7 @@ else
         set -a
         [ -f /etc/hermes/'"${AGENT_SLUG}"'.env ] && . /etc/hermes/'"${AGENT_SLUG}"'.env
         set +a
-        exec sudo -u agent --preserve-env=OPENROUTER_API_KEY,OPENROUTER_BASE_URL,OPENAI_API_KEY,OPENAI_BASE_URL,ANTHROPIC_API_KEY \
+        exec sudo -u agent --preserve-env=OPENROUTER_API_KEY,OPENROUTER_BASE_URL,OPENAI_API_KEY,OPENAI_BASE_URL,ANTHROPIC_API_KEY,HERMES_LANGFUSE_PUBLIC_KEY,HERMES_LANGFUSE_SECRET_KEY,HERMES_LANGFUSE_HOST,MONOLITH_TRACE_ENABLED,MONOLITH_TRACE_TENANT_ID,MONOLITH_TRACE_AGENT_NAME,MONOLITH_TRACE_CONTAINER_ID,MONOLITH_TRACE_INGEST_URL,MONOLITH_TRACE_INGEST_API_KEY,MONOLITH_OBSERVABILITY_PROXY_URL,OTEL_SERVICE_NAME,OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_RESOURCE_ATTRIBUTES \
             env HOME=/home/agent HERMES_HOME=/home/agent/.hermes \
             /home/agent/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
     ' >/var/log/raava/hermes-gateway.log 2>&1 < /dev/null &
