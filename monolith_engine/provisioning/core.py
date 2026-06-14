@@ -119,7 +119,7 @@ def _env_file_key(value: object) -> str:
 
 
 def _env_file_value(value: object) -> str:
-    return str(value)
+    return shlex.quote(str(value))
 
 
 def render_configs(template: TemplateSpec, context: dict) -> dict[str, str]:
