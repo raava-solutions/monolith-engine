@@ -71,6 +71,13 @@ class TemplateSpec:
         return str(self.raw.get("visibility") or "public")
 
 
+@dataclass
+class LocalStage:
+    source: Path
+    target: str
+    required: bool = True
+
+
 def load_template(name: str) -> TemplateSpec:
     # Template names must be a single, literal path component. Reject separators,
     # empty/relative names, and anything Path would split, so a user template dir
@@ -167,6 +174,71 @@ def build_context(template: TemplateSpec, *, agent_name: str, role: str, model: 
     return ctx
 
 
+def _is_local_docker_provider(provider: ComputeProvider) -> bool:
+    cls = provider.__class__
+    return cls.__name__ == "DockerProvider" or cls.__module__.endswith(".docker")
+
+
+def _iter_local_stage_entries(template: TemplateSpec) -> list[dict]:
+    entries: list[dict] = []
+    raw_entries = template.raw.get("local_stages") or []
+    if isinstance(raw_entries, list):
+        entries.extend(item for item in raw_entries if isinstance(item, dict))
+    docker = (template.raw.get("providers") or {}).get("docker") or {}
+    docker_entries = docker.get("local_stages") or []
+    if isinstance(docker_entries, list):
+        entries.extend(item for item in docker_entries if isinstance(item, dict))
+    return entries
+
+
+def _template_local_stages(template: TemplateSpec) -> list[LocalStage]:
+    stages: list[LocalStage] = []
+    for entry in _iter_local_stage_entries(template):
+        source = str(entry.get("source") or entry.get("local_path") or "").strip()
+        target = str(entry.get("target") or entry.get("remote_path") or "").strip()
+        if not source or not target.startswith("/"):
+            continue
+        stages.append(
+            LocalStage(
+                source=Path(source).expanduser(),
+                target=target,
+                required=bool(entry.get("required", True)),
+            )
+        )
+
+    script_path = template.path / "provision.sh"
+    try:
+        script = script_path.read_text()
+    except OSError:
+        script = ""
+    outreach_source = Path(os.environ.get("RAAVA_OUTREACH_PATH", "/Users/master/raava-outreach")).expanduser()
+    if "/opt/raava-outreach" in script:
+        stages.append(LocalStage(source=outreach_source, target="/opt/raava-outreach", required=False))
+
+    deduped: dict[str, LocalStage] = {}
+    for stage in stages:
+        deduped[stage.target] = stage
+    return list(deduped.values())
+
+
+async def _stage_local_paths(provider: ComputeProvider, container: str, template: TemplateSpec) -> None:
+    if not _is_local_docker_provider(provider):
+        return
+    for stage in _template_local_stages(template):
+        if not stage.source.exists():
+            if stage.required:
+                raise ProvisionError("stage", f"local stage source not found: {stage.source}")
+            continue
+        parent = shlex.quote(str(Path(stage.target).parent))
+        result = await provider.exec_command(container, ["sh", "-c", f"mkdir -p {parent}"], timeout=30)
+        if result.exit_code != 0:
+            raise ProvisionError("stage", f"creating {Path(stage.target).parent} failed: {result.stderr.strip()}")
+        try:
+            await provider.push_file(str(stage.source), container, stage.target)
+        except Exception as exc:
+            raise ProvisionError("stage", f"staging {stage.source} to {stage.target} failed: {exc}") from exc
+
+
 async def _push_text(provider: ComputeProvider, container: str, content: str, remote_path: str) -> None:
     # base64 through exec — works on every provider without host temp files.
     b64 = base64.b64encode(content.encode()).decode()
@@ -220,6 +292,7 @@ async def provision_agent(
     # 2. Render + stage configs and the provision script.
     rendered = render_configs(template, context)
     await provider.exec_command(agent_name, ["mkdir", "-p", "/tmp/raava-provision"], timeout=30)
+    await _stage_local_paths(provider, agent_name, template)
     for filename, content in rendered.items():
         await _push_text(provider, agent_name, content, f"/tmp/raava-provision/{filename}")
     script = (template.path / "provision.sh").read_text()
@@ -251,6 +324,7 @@ async def provision_agent(
 
 __all__ = [
     "ProvisionError",
+    "LocalStage",
     "TemplateSpec",
     "build_context",
     "list_templates",
