@@ -14,6 +14,7 @@ from monolith_engine.provisioning.core import (
     build_context,
     list_templates,
     load_template,
+    provision_agent,
     render_configs,
 )
 
@@ -54,6 +55,32 @@ def test_tampered_token_refused(tmp_path):
     bad = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB")
     with pytest.raises(_jwt.InvalidTokenError):
         verify_run_token(bad, pem)
+
+
+class DockerProvider:
+    def __init__(self):
+        self.containers: dict[str, dict] = {}
+        self.exec_calls: list[list[str]] = []
+        self.pushes: list[tuple[str, str, str]] = []
+
+    async def create(self, name, image, vcpus, memory_mb, disk_gb, metadata):
+        self.containers[name] = {"image": image, "status": "running", "ip": "172.17.0.2"}
+        return "container-id"
+
+    async def exec_command(self, name, command, timeout=30):
+        from monolith_engine.ports.provider import ExecResult
+
+        self.exec_calls.append(command)
+        return ExecResult(stdout="ok\n", stderr="", exit_code=0)
+
+    async def get_state(self, name):
+        from monolith_engine.ports.provider import VMState
+
+        c = self.containers[name]
+        return VMState(name=name, status=c["status"], ip=c["ip"])
+
+    async def push_file(self, local_path, name, remote_path):
+        self.pushes.append((local_path, name, remote_path))
 
 
 # ── Provisioning core (render path; container exec covered live) ─────────────
@@ -172,3 +199,37 @@ def test_hermes_no_systemd_preserves_langfuse_and_otel_env():
     assert "OTEL_SERVICE_NAME" in script
     assert "OTEL_EXPORTER_OTLP_ENDPOINT" in script
     assert "OTEL_RESOURCE_ATTRIBUTES" in script
+
+
+def test_provision_agent_stages_template_local_paths_for_docker(monkeypatch, tmp_path):
+    import asyncio
+
+    source = tmp_path / "source-repo"
+    source.mkdir()
+    user_templates = tmp_path / "user-templates"
+    template_dir = user_templates / "private"
+    template_dir.mkdir(parents=True)
+    (template_dir / "template.yaml").write_text(
+        "name: private\n"
+        "providers:\n"
+        "  docker:\n"
+        "    image: private:latest\n"
+        "    local_stages:\n"
+        f"      - source: {source}\n"
+        "        target: /opt/private-source\n"
+    )
+    (template_dir / "provision.sh").write_text("#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("MONOLITH_TEMPLATE_DIR", str(user_templates))
+
+    provider = DockerProvider()
+    asyncio.run(
+        provision_agent(
+            provider,
+            template_name="private",
+            agent_name="agent-local-stage",
+            role="agent",
+        )
+    )
+
+    assert provider.pushes == [(str(source), "agent-local-stage", "/opt/private-source")]
+    assert ["sh", "-c", "mkdir -p /opt"] in provider.exec_calls
