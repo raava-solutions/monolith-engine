@@ -30,7 +30,7 @@ class FakeProvider:
     async def delete(self, name):
         self.containers.pop(name, None)
 
-    async def exec_command(self, name, command, timeout=30):
+    async def exec_command(self, name, command, timeout=30, input_bytes=None):
         return self.exec_result
 
     # Unused-by-proof methods kept as no-ops so the double satisfies callers.

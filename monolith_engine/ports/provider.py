@@ -107,7 +107,11 @@ class ComputeProvider(ABC):
 
     @abstractmethod
     async def exec_command(
-        self, name: str, command: list[str], timeout: int = 30
+        self,
+        name: str,
+        command: list[str],
+        timeout: int = 30,
+        input_bytes: bytes | None = None,
     ) -> ExecResult: ...
 
     @abstractmethod

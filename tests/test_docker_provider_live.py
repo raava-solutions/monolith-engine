@@ -43,3 +43,20 @@ async def test_create_exec_delete_roundtrip():
         if await provider.exists(name):
             await provider.delete(name)
         assert not await provider.exists(name)
+
+
+async def test_write_file_large_payload_roundtrip():
+    provider = get_provider("docker")
+    name = f"engine-test-{uuid.uuid4().hex[:8]}"
+    payload = (b"monolith-engine-large-write\n" * ((2 * 1024 * 1024) // 28 + 1))[
+        : 2 * 1024 * 1024
+    ]
+    path = "/tmp/large-payload.txt"
+    try:
+        await provider.create(name, "ubuntu:24.04", 1, 256, 5, {"test": "1"})
+        await provider.write_file(name, path, payload)
+        assert await provider.read_file(name, path) == payload
+    finally:
+        if await provider.exists(name):
+            await provider.delete(name)
+        assert not await provider.exists(name)
