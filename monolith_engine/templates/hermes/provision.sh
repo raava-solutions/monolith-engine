@@ -124,6 +124,9 @@ if [ -f /tmp/raava-provision/paperclip-agent-gateway.py ] && [ -f /tmp/raava-pro
     chmod 644 /etc/systemd/system/paperclip-agent-gateway.service
 fi
 
+# Ensure the hermes config dir exists before any /etc/hermes writes below.
+mkdir -p /etc/hermes
+
 HUD_COLLECTOR_ENABLED=false
 if [ -f /tmp/raava-provision/env ] && grep -q '^MONOLITH_HUD_ENABLED=true' /tmp/raava-provision/env; then
     HUD_COLLECTOR_ENABLED=true
