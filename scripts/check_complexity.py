@@ -2,7 +2,7 @@
 
 The reviewed baseline contains legacy functions only. New functions must be <=10;
 existing functions cannot exceed their recorded score. Reductions require lowering
-or removing their baseline entry. Ruff is pinned in the development dependencies.
+or removing their baseline entry. Ruff is pinned in development dependencies.
 """
 
 from __future__ import annotations
@@ -20,19 +20,26 @@ BASELINE = ROOT / "quality/complexity-baseline.json"
 
 def qualified_function(path: Path, line: int) -> str:
     tree = ast.parse(path.read_text())
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, functions) and node.lineno == line
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Cannot resolve unique function at {path}:{line}")
+    node = matches[0]
     names = []
-    node = tree
-    while True:
-        candidates = [
-            child
-            for child in ast.iter_child_nodes(node)
-            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            and child.lineno <= line <= child.end_lineno
-        ]
-        if not candidates:
-            return ".".join(names)
-        node = candidates[0]
-        names.append(node.name)
+    while node is not tree:
+        if isinstance(node, (ast.ClassDef, *functions)):
+            names.append(node.name)
+        node = parents[node]
+    return ".".join(reversed(names))
 
 
 def scores() -> dict[str, int]:
@@ -62,7 +69,10 @@ def scores() -> dict[str, int]:
         path = Path(item["filename"])
         name = qualified_function(path, item["location"]["row"])
         score = int(re.search(r"\((\d+) >", item["message"]).group(1))
-        measured[f"{path.relative_to(ROOT).as_posix()}::{name}"] = score
+        key = f"{path.relative_to(ROOT).as_posix()}::{name}"
+        if key in measured:
+            raise ValueError(f"Duplicate complexity symbol: {key}; use unique names")
+        measured[key] = score
     return measured
 
 
