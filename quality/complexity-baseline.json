@@ -1,0 +1,6 @@
+{
+  "ceilings": {
+    "monolith_engine/workflows/fsm.py::execute_run": 11,
+    "monolith_engine/workflows/runner.py::make_step_runner": 11
+  }
+}

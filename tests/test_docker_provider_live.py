@@ -1,6 +1,6 @@
 """Docker provider — live tier (opt-in, real docker daemon).
 
-Skipped unless a docker daemon is reachable. Proves the carved provider
+Skipped unless --live-docker is passed and a Docker daemon is reachable. Proves the carved provider
 drives real containers identically to its pre-carve behavior.
 """
 
@@ -27,7 +27,14 @@ def _docker_ready() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _docker_ready(), reason="docker daemon not available")
+pytestmark = pytest.mark.live_docker
+
+
+@pytest.fixture(autouse=True)
+def require_docker():
+    # Run during setup only, after collection has applied the explicit opt-in.
+    if not _docker_ready():
+        pytest.skip("docker daemon not available")
 
 
 async def test_create_exec_delete_roundtrip():
@@ -60,3 +67,4 @@ async def test_write_file_large_payload_roundtrip():
         if await provider.exists(name):
             await provider.delete(name)
         assert not await provider.exists(name)
+

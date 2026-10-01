@@ -63,6 +63,29 @@ async def dispatch_run(
     )
 
 
+async def _execute_step_attempts(
+    storage: StorageBackend, runner: StepRunner, *, run_id: str,
+    tenant_id: str, step_index: int, step: StepSpec, workflow_target: str | None,
+) -> StepOutcome | None:
+    """Apply a bounded retry budget, honoring cancellation before every attempt."""
+    for attempt in range(step.retry_budget + 1):
+        current = await storage.get_run(run_id)
+        if current is None or current["status"] == "cancelled":
+            return None
+        await storage.set_step_dispatched(run_id, step_index, attempt)
+        await storage.heartbeat_run(run_id)
+        try:
+            outcome = await runner(StepContext(
+                run_id=run_id, tenant_id=tenant_id, step_index=step_index,
+                step=step, attempt=attempt, workflow_target=workflow_target,
+            ))
+        except Exception as exc:  # runner crash → failed attempt
+            outcome = StepOutcome(status="failed", error=str(exc))
+        if outcome.status == "completed":
+            return outcome
+    return outcome
+
+
 async def execute_run(
     storage: StorageBackend, run_id: str, spec: WorkflowSpec, runner: StepRunner
 ) -> str:
@@ -70,6 +93,8 @@ async def execute_run(
     run = await storage.get_run(run_id)
     if run is None:
         raise LookupError(f"run {run_id} not found")
+    if run["status"] in TERMINAL_RUN_STATUSES:
+        return run["status"]
     tenant_id = run["tenant_id"]
     steps = spec.steps
     start_index = int(run["current_step"])
@@ -84,27 +109,12 @@ async def execute_run(
             continue  # resume: already committed
 
         step_spec = steps[idx]
-        outcome: StepOutcome | None = None
-        for attempt in range(step_spec.retry_budget + 1):
-            await storage.set_step_dispatched(run_id, idx, attempt)
-            await storage.heartbeat_run(run_id)
-            try:
-                outcome = await runner(
-                    StepContext(
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        step_index=idx,
-                        step=step_spec,
-                        attempt=attempt,
-                        workflow_target=spec.target,
-                    )
-                )
-            except Exception as exc:  # runner crash → failed attempt
-                outcome = StepOutcome(status="failed", error=str(exc))
-            if outcome.status == "completed":
-                break
-
-        assert outcome is not None
+        outcome = await _execute_step_attempts(
+            storage, runner, run_id=run_id, tenant_id=tenant_id,
+            step_index=idx, step=step_spec, workflow_target=spec.target,
+        )
+        if outcome is None:
+            return "cancelled"
 
         # Late cancellation wins over a terminal write.
         latest = await storage.get_run(run_id)
@@ -142,3 +152,4 @@ __all__ = [
     "dispatch_run",
     "execute_run",
 ]
+

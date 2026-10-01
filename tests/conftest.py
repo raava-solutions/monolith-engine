@@ -38,3 +38,22 @@ class FakeProvider:
     async def stop(self, name, force=False): ...
     async def list_vms(self): return list(self.containers)
     async def get_ip(self, name): return self.containers.get(name, {}).get("ip")
+
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--live-docker", action="store_true", default=False,
+        help="Run tests that create/delete real Docker containers (explicit opt-in)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--live-docker"):
+        return
+    import pytest
+
+    skip = pytest.mark.skip(reason="requires explicit --live-docker opt-in")
+    for item in items:
+        if "live_docker" in item.keywords:
+            item.add_marker(skip)

@@ -13,13 +13,15 @@ authors = [{ name = "Raava" }]
 dependencies = ["pydantic>=2.0", "jinja2>=3.1", "PyYAML>=6.0", "PyJWT>=2.8", "cryptography>=42"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff==0.16.6"]
 
 [tool.setuptools.packages.find]
 include = ["monolith_engine*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["live_docker: creates/deletes real containers; requires --live-docker"]
 
 [tool.setuptools.package-data]
 monolith_engine = ["templates/**/*", "images/**/*"]
+
